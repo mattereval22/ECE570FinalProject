@@ -1,21 +1,15 @@
-"""
-bug_classifier.py
-----------------------------------------
-Handles AI model training and inference for HDL bug classification.
-Uses token-based features for classical ML and can be extended with deep learning.
-"""
-
 import pandas as pd
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import classification_report
 import joblib
 from pathlib import Path
+import os
 
 # Paths
-BASE_DIR = Path(__file__).resolve().parent.parent / "Checkpoint2"
-TRAIN_PATH = BASE_DIR / "hdl_train.csv"
-TEST_PATH = BASE_DIR / "hdl_test.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRAIN_PATH = os.path.join(BASE_DIR, "hdl_train.csv")
+TEST_PATH  = os.path.join(BASE_DIR, "hdl_test.csv")
 
 MODEL_PATH = Path(__file__).resolve().parent / "hdl_bug_classifier.pkl"
 VECTORIZER_PATH = Path(__file__).resolve().parent / "hdl_vectorizer.pkl"
