@@ -7,12 +7,12 @@ from pathlib import Path
 import os
 
 # Paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRAIN_PATH = os.path.join(BASE_DIR, "hdl_train.csv")
-TEST_PATH  = os.path.join(BASE_DIR, "hdl_test.csv")
+BASE_DIR = Path(__file__).resolve().parent
+TRAIN_PATH = BASE_DIR / "hdl_train.csv"
+TEST_PATH = BASE_DIR / "hdl_test.csv"
 
-MODEL_PATH = Path(__file__).resolve().parent / "hdl_bug_classifier.pkl"
-VECTORIZER_PATH = Path(__file__).resolve().parent / "hdl_vectorizer.pkl"
+MODEL_PATH = BASE_DIR / "hdl_bug_classifier.pkl"
+VECTORIZER_PATH = BASE_DIR / "hdl_vectorizer.pkl"
 
 
 def train_model():
@@ -20,6 +20,8 @@ def train_model():
     print("CWD:", os.getcwd())
     print("BASE_DIR:", BASE_DIR)
     print("TRAIN_PATH:", TRAIN_PATH)
+    train_df = pd.read_csv(TRAIN_PATH)
+    test_df = pd.read_csv(TEST_PATH)
 
     vectorizer = CountVectorizer()
     X_train = vectorizer.fit_transform(train_df["tokens"])
