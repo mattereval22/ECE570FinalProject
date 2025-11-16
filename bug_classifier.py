@@ -17,9 +17,9 @@ VECTORIZER_PATH = Path(__file__).resolve().parent / "hdl_vectorizer.pkl"
 
 def train_model():
     print("🔧 Training HDL Bug Classifier...")
-
-    train_df = pd.read_csv(TRAIN_PATH)
-    test_df = pd.read_csv(TEST_PATH)
+    print("CWD:", os.getcwd())
+    print("BASE_DIR:", BASE_DIR)
+    print("TRAIN_PATH:", TRAIN_PATH)
 
     vectorizer = CountVectorizer()
     X_train = vectorizer.fit_transform(train_df["tokens"])
