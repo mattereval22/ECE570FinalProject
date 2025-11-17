@@ -31,7 +31,7 @@ MAX_LEN   = 512          # max sequence length (tokens per example)
 EMB_DIM   = 128          # embedding dimension
 LSTM_UNITS = 128         # BiLSTM units
 BATCH_SIZE = 64
-EPOCHS     = 5
+EPOCHS     = 15
 DECISION_THRESHOLD = 0.4  # probability threshold for predicting 'bug'
 
 
@@ -76,39 +76,54 @@ def prepare_sequences(train_texts, test_texts):
 # -------------
 
 def build_model():
-    model = models.Sequential([
-        # 1) Token embedding
-        layers.Embedding(
-            input_dim=MAX_VOCAB,
-            output_dim=EMB_DIM,
-            input_length=MAX_LEN,
-        ),
+    """Build a deeper CNN + BiLSTM + Multi-Head Attention model."""
+    inputs = layers.Input(shape=(MAX_LEN,), dtype="int32")
 
-        # 2) 1D convolution to capture local n-gram patterns
-        layers.Conv1D(
-            filters=128,
-            kernel_size=5,
-            activation="relu",
-            padding="same",
-        ),
+    # 1) Token embedding
+    x = layers.Embedding(
+        input_dim=MAX_VOCAB,
+        output_dim=EMB_DIM,
+    )(inputs)
 
-        # 3) Max pooling to reduce sequence length and focus on strongest features
-        layers.MaxPooling1D(pool_size=2),
+    # 2) Two Conv1D + MaxPooling blocks to capture local n-gram patterns
+    x = layers.Conv1D(
+        filters=128,
+        kernel_size=5,
+        activation="relu",
+        padding="same",
+    )(x)
+    x = layers.MaxPooling1D(pool_size=2)(x)
 
-        # 4) BiLSTM to capture longer-range dependencies over pooled features
-        layers.Bidirectional(
-            layers.LSTM(LSTM_UNITS, return_sequences=False)
-        ),
+    x = layers.Conv1D(
+        filters=128,
+        kernel_size=5,
+        activation="relu",
+        padding="same",
+    )(x)
+    x = layers.MaxPooling1D(pool_size=2)(x)
 
-        # 5) Dense + Dropout head
-        layers.Dense(128, activation="relu"),
-        layers.Dropout(0.5),
-        layers.Dense(1, activation="sigmoid"),  # binary output: bug vs clean
-    ])
+    # 3) BiLSTM over the convolved features (keep sequence for attention)
+    x = layers.Bidirectional(
+        layers.LSTM(LSTM_UNITS, return_sequences=True)
+    )(x)
 
+    # 4) Multi-Head Self-Attention to let the model focus on important timesteps
+    attn_output = layers.MultiHeadAttention(num_heads=4, key_dim=LSTM_UNITS)(x, x)
+    x = layers.Add()([x, attn_output])
+    x = layers.LayerNormalization(epsilon=1e-6)(x)
+
+    # 5) Global pooling + dense head
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(1, activation="sigmoid")(x)
+
+    model = models.Model(inputs=inputs, outputs=outputs)
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
     model.compile(
         loss="binary_crossentropy",
-        optimizer="adam",
+        optimizer=optimizer,
         metrics=["accuracy"],
     )
 
