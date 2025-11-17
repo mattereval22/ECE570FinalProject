@@ -24,13 +24,13 @@ TEST_PATH = BASE_DIR / "hdl_test.csv"
 DL_MODEL_PATH = BASE_DIR / "dl_bug_classifier.keras"
 TOKENIZER_PATH = BASE_DIR / "dl_tokenizer.pkl"
 
-# Hyperparameters (you can tune these)
+# Hyperparameters
 MAX_VOCAB = 20000        # max number of tokens in vocab
-MAX_LEN = 512            # max sequence length (tokens per example)
-EMB_DIM = 128            # embedding dimension
-LSTM_UNITS = 64          # BiLSTM units
+MAX_LEN   = 512          # max sequence length (tokens per example)
+EMB_DIM   = 128          # embedding dimension
+LSTM_UNITS = 128         # BiLSTM units
 BATCH_SIZE = 64
-EPOCHS = 5
+EPOCHS     = 5
 
 
 # -------------
@@ -74,42 +74,59 @@ def prepare_sequences(train_texts, test_texts):
 # -------------
 
 def build_model():
-    """Build a simple BiLSTM model for binary classification."""
     model = models.Sequential([
+        # 1) Token embedding
         layers.Embedding(
             input_dim=MAX_VOCAB,
             output_dim=EMB_DIM,
-            input_length=MAX_LEN
+            input_length=MAX_LEN,
         ),
-        layers.Bidirectional(layers.LSTM(LSTM_UNITS)),
-        layers.Dense(64, activation="relu"),
+
+        # 2) 1D convolution to capture local n-gram patterns
+        layers.Conv1D(
+            filters=128,
+            kernel_size=5,
+            activation="relu",
+            padding="same",
+        ),
+
+        # 3) Max pooling to reduce sequence length and focus on strongest features
+        layers.MaxPooling1D(pool_size=2),
+
+        # 4) BiLSTM to capture longer-range dependencies over pooled features
+        layers.Bidirectional(
+            layers.LSTM(LSTM_UNITS, return_sequences=False)
+        ),
+
+        # 5) Dense + Dropout head
+        layers.Dense(128, activation="relu"),
         layers.Dropout(0.5),
-        layers.Dense(1, activation="sigmoid")  # binary output: bug vs clean
+        layers.Dense(1, activation="sigmoid"),  # binary output: bug vs clean
     ])
 
     model.compile(
         loss="binary_crossentropy",
         optimizer="adam",
-        metrics=["accuracy"]
+        metrics=["accuracy"],
     )
 
     return model
-
 
 # -------------
 # Training loop
 # -------------
 
+
 def train_model():
-    print("🔧 Training DL HDL Bug Classifier (BiLSTM)...")
+    print("🔧 Training DL HDL Bug Classifier (CNN + BiLSTM)...")
     print("CWD:", os.getcwd())
     print("BASE_DIR:", BASE_DIR)
     print("TRAIN_PATH:", TRAIN_PATH)
     print("TEST_PATH:", TEST_PATH)
 
-    # Load raw texts + labels
+    # Load data (tokens + labels) from CSV
     train_texts, train_labels = load_data(TRAIN_PATH)
-    test_texts, test_labels = load_data(TEST_PATH)
+    test_texts,  test_labels  = load_data(TEST_PATH)
 
     # Split train into train/val at the TEXT level
     X_train_texts, X_val_texts, y_train, y_val = train_test_split(
@@ -120,17 +137,17 @@ def train_model():
         stratify=train_labels,
     )
 
-    # ---- Fit ONE tokenizer on *all* training texts ----
+    # ---- Fit ONE tokenizer on *training* texts ----
     tokenizer = Tokenizer(num_words=MAX_VOCAB, oov_token="<UNK>")
     tokenizer.fit_on_texts(X_train_texts)
 
-    # Convert all splits to sequences using the SAME tokenizer
     def texts_to_padded(texts):
         seqs = tokenizer.texts_to_sequences(texts)
         return pad_sequences(
             seqs, maxlen=MAX_LEN, padding="post", truncating="post"
         )
 
+    # Convert all splits using the SAME tokenizer
     X_train = texts_to_padded(X_train_texts)
     X_val   = texts_to_padded(X_val_texts)
     X_test  = texts_to_padded(test_texts)
@@ -143,20 +160,21 @@ def train_model():
     model = build_model()
     model.summary(print_fn=lambda x: print("   " + x))
 
-    # Optional: early stopping on val_loss so we don’t over/undertrain
-    callback = tf.keras.callbacks.EarlyStopping(
+    # Early stopping on val_loss to keep best model
+    early_stop = tf.keras.callbacks.EarlyStopping(
         monitor="val_loss",
         patience=2,
         restore_best_weights=True,
     )
 
+    # Train
     history = model.fit(
         X_train,
         y_train,
         validation_data=(X_val, y_val),
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
-        callbacks=[callback],
+        callbacks=[early_stop],
     )
 
     # Evaluate on test set
@@ -164,7 +182,7 @@ def train_model():
     y_pred_probs = model.predict(X_test).ravel()
     y_pred = (y_pred_probs >= 0.5).astype(int)
 
-    print("\n📊 DL Model Evaluation (BiLSTM):")
+    print("\n📊 DL Model Evaluation (CNN + BiLSTM):")
     print(classification_report(y_test, y_pred, target_names=["clean", "bug"]))
 
     # Save model & tokenizer
