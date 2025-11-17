@@ -27,16 +27,23 @@ TOKENIZER_PATH = BASE_DIR / "dl_tokenizer.pkl"
 
 # Hyperparameters
 MAX_VOCAB = 20000        # max number of tokens in vocab
-# We set MAX_LEN to a very large value so that, given the current dataset
-# (max sequence length ~9k tokens), we effectively do *no truncation*.
-# This ensures the model can see the entire file.
-MAX_LEN   = 9000         # effective max sequence length (covers full files)
+# Use a large but more manageable max sequence length so the model
+# still sees most files without making training intractable.
+# This reduces padding and makes optimization easier than 9000 tokens.
+MAX_LEN   = 1536         # effective max sequence length
 EMB_DIM   = 128          # embedding dimension
 LSTM_UNITS = 128         # BiLSTM units
-# Lower batch size to keep GPU memory manageable with long sequences
-BATCH_SIZE = 16
-EPOCHS     = 15
+# Slightly larger batch size now that sequences are shorter
+BATCH_SIZE = 32
+EPOCHS     = 10
 DECISION_THRESHOLD = 0.5
+
+# Optional "debug" mode for lighter experiments in Colab.
+# When DEBUG_MODE is True, training will use only a fraction of the
+# training set and fewer epochs to save compute.
+DEBUG_MODE = False
+DEBUG_FRACTION = 0.3   # use 30% of the training set in debug mode
+DEBUG_EPOCHS = 15       # train for fewer epochs in debug mode
 
 
 # -------------
@@ -149,6 +156,14 @@ def train_model():
     train_texts, train_labels = load_data(TRAIN_PATH)
     test_texts,  test_labels  = load_data(TEST_PATH)
 
+    # Optional debug subsampling to speed up experiments
+    if DEBUG_MODE:
+        n_debug = int(len(train_texts) * DEBUG_FRACTION)
+        train_texts = train_texts[:n_debug]
+        train_labels = train_labels[:n_debug]
+        print(f"DEBUG_MODE is ON: using first {n_debug} training examples "
+              f"({DEBUG_FRACTION:.0%} of the original)")
+
     # Split train into train/val at the TEXT level
     X_train_texts, X_val_texts, y_train, y_val = train_test_split(
         train_texts,
@@ -198,13 +213,16 @@ def train_model():
         restore_best_weights=True,
     )
 
+    # Decide how many epochs to run (debug vs full)
+    epochs = DEBUG_EPOCHS if DEBUG_MODE else EPOCHS
+
     # Train
     history = model.fit(
         X_train,
         y_train,
         validation_data=(X_val, y_val),
         batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
+        epochs=epochs,
         callbacks=[early_stop],
         class_weight=class_weight_dict,
     )
