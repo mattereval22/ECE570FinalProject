@@ -1,10 +1,3 @@
-"""
-dl_classifier.py
-----------------------------------------
-Deep learning HDL bug classifier using a BiLSTM over token sequences.
-Reads the same hdl_train.csv / hdl_test.csv as bug_classifier.py.
-"""
-
 from pathlib import Path
 import os
 import joblib
@@ -114,38 +107,56 @@ def train_model():
     print("TRAIN_PATH:", TRAIN_PATH)
     print("TEST_PATH:", TEST_PATH)
 
-    # Load data
+    # Load raw texts + labels
     train_texts, train_labels = load_data(TRAIN_PATH)
     test_texts, test_labels = load_data(TEST_PATH)
 
-    # Split train into train/val
+    # Split train into train/val at the TEXT level
     X_train_texts, X_val_texts, y_train, y_val = train_test_split(
         train_texts,
         train_labels,
         test_size=0.2,
         random_state=42,
-        stratify=train_labels
+        stratify=train_labels,
     )
 
-    # Tokenize & pad
-    X_train, X_val, tokenizer = prepare_sequences(X_train_texts, X_val_texts)
-    _, X_test, _ = prepare_sequences(train_texts, test_texts)  # reuse vocab from train
+    # ---- Fit ONE tokenizer on *all* training texts ----
+    tokenizer = Tokenizer(num_words=MAX_VOCAB, oov_token="<UNK>")
+    tokenizer.fit_on_texts(X_train_texts)
+
+    # Convert all splits to sequences using the SAME tokenizer
+    def texts_to_padded(texts):
+        seqs = tokenizer.texts_to_sequences(texts)
+        return pad_sequences(
+            seqs, maxlen=MAX_LEN, padding="post", truncating="post"
+        )
+
+    X_train = texts_to_padded(X_train_texts)
+    X_val   = texts_to_padded(X_val_texts)
+    X_test  = texts_to_padded(test_texts)
 
     y_train = np.array(y_train)
-    y_val = np.array(y_val)
-    y_test = np.array(test_labels)
+    y_val   = np.array(y_val)
+    y_test  = np.array(test_labels)
 
     # Build model
     model = build_model()
     model.summary(print_fn=lambda x: print("   " + x))
 
-    # Train
+    # Optional: early stopping on val_loss so we don’t over/undertrain
+    callback = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=2,
+        restore_best_weights=True,
+    )
+
     history = model.fit(
         X_train,
         y_train,
         validation_data=(X_val, y_val),
         batch_size=BATCH_SIZE,
-        epochs=EPOCHS
+        epochs=EPOCHS,
+        callbacks=[callback],
     )
 
     # Evaluate on test set
@@ -162,7 +173,6 @@ def train_model():
 
     print(f"\n✅ DL model saved to: {DL_MODEL_PATH}")
     print(f"✅ Tokenizer saved to: {TOKENIZER_PATH}")
-
 
 def predict_single(code_tokens: str):
     """
