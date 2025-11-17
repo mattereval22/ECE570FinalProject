@@ -27,10 +27,14 @@ TOKENIZER_PATH = BASE_DIR / "dl_tokenizer.pkl"
 
 # Hyperparameters
 MAX_VOCAB = 20000        # max number of tokens in vocab
-MAX_LEN   = 512          # max sequence length (tokens per example)
+# We set MAX_LEN to a very large value so that, given the current dataset
+# (max sequence length ~9k tokens), we effectively do *no truncation*.
+# This ensures the model can see the entire file.
+MAX_LEN   = 9000         # effective max sequence length (covers full files)
 EMB_DIM   = 128          # embedding dimension
 LSTM_UNITS = 128         # BiLSTM units
-BATCH_SIZE = 64
+# Lower batch size to keep GPU memory manageable with long sequences
+BATCH_SIZE = 16
 EPOCHS     = 15
 DECISION_THRESHOLD = 0.5
 
