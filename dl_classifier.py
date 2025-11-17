@@ -6,6 +6,7 @@ import pandas as pd
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from sklearn.utils.class_weight import compute_class_weight
 
 import tensorflow as tf
 from tensorflow.keras.preprocessing.text import Tokenizer
@@ -31,6 +32,7 @@ EMB_DIM   = 128          # embedding dimension
 LSTM_UNITS = 128         # BiLSTM units
 BATCH_SIZE = 64
 EPOCHS     = 5
+DECISION_THRESHOLD = 0.4  # probability threshold for predicting 'bug'
 
 
 # -------------
@@ -156,6 +158,16 @@ def train_model():
     y_val   = np.array(y_val)
     y_test  = np.array(test_labels)
 
+    # Compute class weights so bugs are not ignored
+    classes = np.array([0, 1])  # 0 = clean, 1 = bug
+    class_weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=y_train,
+    )
+    class_weight_dict = {0: class_weights[0], 1: class_weights[1]}
+    print("Class weights:", class_weight_dict)
+
     # Build model
     model = build_model()
     model.summary(print_fn=lambda x: print("   " + x))
@@ -175,12 +187,14 @@ def train_model():
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         callbacks=[early_stop],
+        class_weight=class_weight_dict,
     )
 
     # Evaluate on test set
     print("\n📊 Evaluating on test set...")
     y_pred_probs = model.predict(X_test).ravel()
-    y_pred = (y_pred_probs >= 0.5).astype(int)
+    y_pred = (y_pred_probs >= DECISION_THRESHOLD).astype(int)
+    print(f"Using decision threshold {DECISION_THRESHOLD}, fraction predicted as bug: {y_pred.mean():.3f}")
 
     print("\n📊 DL Model Evaluation (CNN + BiLSTM):")
     print(classification_report(y_test, y_pred, target_names=["clean", "bug"]))
