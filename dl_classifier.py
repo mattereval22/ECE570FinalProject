@@ -32,7 +32,7 @@ EMB_DIM   = 128          # embedding dimension
 LSTM_UNITS = 128         # BiLSTM units
 BATCH_SIZE = 64
 EPOCHS     = 15
-DECISION_THRESHOLD = 0.4  # probability threshold for predicting 'bug'
+DECISION_THRESHOLD = 0.5
 
 
 # -------------
