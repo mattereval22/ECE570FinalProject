@@ -175,20 +175,20 @@ def build_model(num_classes: int):
     """
     inputs = layers.Input(shape=IMG_SIZE + (3,))
 
-    # Basic rescaling
-    x = layers.Rescaling(1.0 / 255)(inputs)
-
     # Pretrained backbone (ImageNet weights)
     base_model = tf.keras.applications.EfficientNetB0(
         include_top=False,
-        input_tensor=x,
-        pooling="avg",
+        input_tensor=inputs,
+        pooling=None,
         weights="imagenet",
     )
     base_model.trainable = False  # start with frozen backbone for stability
 
+    x = base_model(inputs, training=False)
+    x = layers.GlobalAveragePooling2D(name="avg_pool")(x)
+
     # Classification head
-    x = layers.Dense(256, activation="relu")(base_model.output)
+    x = layers.Dense(256, activation="relu")(x)
     x = layers.Dropout(0.5)(x)
     outputs = layers.Dense(num_classes, activation="softmax")(x)
 
