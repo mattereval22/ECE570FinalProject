@@ -9,6 +9,32 @@ from sklearn.utils.class_weight import compute_class_weight
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
+# ------------------------------
+# TensorFlow GPU / XLA settings
+# ------------------------------
+# On some Colab GPUs (e.g., A100) TensorFlow may auto-enable XLA JIT.
+# This can trigger a flood of "Delay kernel timed out" messages from
+# the XLA CUDA timer even though training is actually running.
+#
+# To keep training stable and avoid those warnings, explicitly disable
+# XLA JIT and enable memory growth on the GPU.
+try:
+    # Disable global XLA JIT compilation (autoclustering)
+    tf.config.optimizer.set_jit(False)
+    print("XLA JIT disabled to avoid delay-kernel timeouts.")
+except Exception as e:
+    print("Could not disable XLA JIT:", e)
+
+# Make TensorFlow allocate GPU memory on demand instead of grabbing all at once.
+try:
+    gpus = tf.config.experimental.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Enabled memory growth for {len(gpus)} GPU(s).")
+except Exception as e:
+    print("Could not set GPU memory growth:", e)
+
 # -----------------------
 # Paths & hyperparameters
 # -----------------------
