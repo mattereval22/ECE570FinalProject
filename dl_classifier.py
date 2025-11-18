@@ -52,8 +52,14 @@ CLASS_NAMES_PATH = BASE_DIR / "pcb_class_names.pkl"
 # Image / training hyperparameters
 IMG_SIZE = (224, 224)       # standard for many pretrained backbones
 BATCH_SIZE = 32
-EPOCHS = 15
-LEARNING_RATE = 1e-4
+EPOCHS = 15                 # kept for reference (not directly used in 2‑stage training)
+LEARNING_RATE = 1e-4        # base reference LR (not used directly)
+
+# Two‑stage training hyperparameters
+HEAD_EPOCHS = 8
+FINE_TUNE_EPOCHS = 15
+HEAD_LEARNING_RATE = 5e-4
+FINE_TUNE_LEARNING_RATE = 1e-5
 
 # Optional debug mode to train quickly on a subset of data
 DEBUG_MODE = False
@@ -195,22 +201,37 @@ def compute_class_weights_from_ds(dataset, num_classes):
 # Model building
 # -------------
 
-def build_model(num_classes: int):
-    """
-    Build a CNN-based image classifier using a pretrained EfficientNetB0 backbone.
+def build_model(num_classes: int, learning_rate: float = HEAD_LEARNING_RATE):
+    """Build a CNN-based image classifier using a pretrained EfficientNetB0 backbone.
+
+    This version adds light data augmentation and proper 1/255 rescaling
+    before feeding images into the EfficientNet backbone.
     """
     inputs = layers.Input(shape=IMG_SIZE + (3,))
+
+    # Data augmentation pipeline applied only during training
+    data_augmentation = tf.keras.Sequential(
+        [
+            layers.RandomFlip("horizontal"),
+            layers.RandomRotation(0.05),
+            layers.RandomZoom(0.1),
+        ],
+        name="data_augmentation",
+    )
+
+    x = data_augmentation(inputs)
+    x = layers.Rescaling(1.0 / 255.0, name="rescale_1_255")(x)
 
     # Pretrained backbone (ImageNet weights)
     base_model = tf.keras.applications.EfficientNetB0(
         include_top=False,
-        input_tensor=inputs,
-        pooling=None,
         weights="imagenet",
+        input_shape=IMG_SIZE + (3,),
+        pooling=None,
     )
     base_model.trainable = False  # start with frozen backbone for stability
 
-    x = base_model(inputs, training=False)
+    x = base_model(x, training=False)
     x = layers.GlobalAveragePooling2D(name="avg_pool")(x)
 
     # Classification head
@@ -220,7 +241,7 @@ def build_model(num_classes: int):
 
     model = models.Model(inputs=inputs, outputs=outputs)
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
     model.compile(
         loss="sparse_categorical_crossentropy",
         optimizer=optimizer,
@@ -256,24 +277,65 @@ def train_model():
     class_weight_dict = compute_class_weights_from_ds(train_ds, num_classes)
     print("Class weights:", class_weight_dict)
 
-    # Build model
-    model = build_model(num_classes)
+    # ------------------------
+    # Stage 1: Train classifier head
+    # ------------------------
+    model = build_model(num_classes, learning_rate=HEAD_LEARNING_RATE)
     model.summary(print_fn=lambda x: print("   " + x))
 
-    # Early stopping + checkpoint
-    early_stop = tf.keras.callbacks.EarlyStopping(
+    early_stop_head = tf.keras.callbacks.EarlyStopping(
         monitor="val_loss",
         patience=3,
         restore_best_weights=True,
     )
 
-    # Train
-    history = model.fit(
+    print("\n🚀 Stage 1: training classifier head with frozen EfficientNet backbone...")
+    history_head = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=EPOCHS,
+        epochs=HEAD_EPOCHS,
         class_weight=class_weight_dict,
-        callbacks=[early_stop],
+        callbacks=[early_stop_head],
+    )
+
+    # ------------------------
+    # Stage 2: Fine-tune top EfficientNet blocks
+    # ------------------------
+    base_model = model.get_layer("efficientnetb0")
+    base_model.trainable = True
+
+    # Freeze earlier layers, unfreeze only last ~50 layers for fine-tuning
+    fine_tune_at = max(0, len(base_model.layers) - 50)
+    for layer in base_model.layers[:fine_tune_at]:
+        layer.trainable = False
+
+    print(f"Unfreezing EfficientNet from layer index {fine_tune_at} (of {len(base_model.layers)}) for fine-tuning.")
+
+    # Recompile with a lower learning rate for fine-tuning
+    optimizer_fine = tf.keras.optimizers.Adam(learning_rate=FINE_TUNE_LEARNING_RATE)
+    model.compile(
+        loss="sparse_categorical_crossentropy",
+        optimizer=optimizer_fine,
+        metrics=["accuracy"],
+    )
+
+    early_stop_fine = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=5,
+        restore_best_weights=True,
+    )
+
+    print("\n🛠 Stage 2: fine-tuning top EfficientNet layers...")
+    total_epochs = HEAD_EPOCHS + FINE_TUNE_EPOCHS
+    # Continue training from where Stage 1 left off
+    initial_epoch = history_head.epoch[-1] + 1 if hasattr(history_head, "epoch") else HEAD_EPOCHS
+    history_fine = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=total_epochs,
+        initial_epoch=initial_epoch,
+        class_weight=class_weight_dict,
+        callbacks=[early_stop_fine],
     )
 
     # Evaluate on validation set and print classification report
