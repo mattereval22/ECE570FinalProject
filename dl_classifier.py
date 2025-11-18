@@ -8,6 +8,7 @@ from sklearn.utils.class_weight import compute_class_weight
 
 import tensorflow as tf
 from tensorflow.keras import layers, models
+from tensorflow.keras.applications.efficientnet import EfficientNetB0, preprocess_input
 
 # ------------------------------
 # TensorFlow GPU / XLA settings
@@ -65,6 +66,13 @@ FINE_TUNE_LEARNING_RATE = 1e-5
 DEBUG_MODE = False
 DEBUG_TRAIN_STEPS = 100    # number of batches for training when debug
 DEBUG_VAL_STEPS = 30       # number of batches for validation when debug
+
+# Optional tiny overfit sanity-check mode
+# When True, we train on a very small subset of the data without augmentation
+# to verify that the model can overfit (reach very high training accuracy).
+SANITY_OVERFIT_MODE = True
+SANITY_OVERFIT_TRAIN_IMAGES = 64
+SANITY_OVERFIT_VAL_IMAGES = 64
 
 
 # -------------
@@ -201,11 +209,17 @@ def compute_class_weights_from_ds(dataset, num_classes):
 # Model building
 # -------------
 
-def build_model(num_classes: int, learning_rate: float = HEAD_LEARNING_RATE):
+def build_model(
+    num_classes: int,
+    learning_rate: float = HEAD_LEARNING_RATE,
+    use_augmentation: bool = True,
+):
     """Build a CNN-based image classifier using a pretrained EfficientNetB0 backbone.
 
-    This version adds light data augmentation and proper 1/255 rescaling
-    before feeding images into the EfficientNet backbone.
+    This version uses EfficientNetB0's `preprocess_input` so we don't double-normalize
+    images (we feed in raw [0, 255] pixel values from the dataset and let
+    `preprocess_input` handle scaling/normalization). It also allows turning
+    data augmentation on/off (for tiny overfit sanity checks).
     """
     inputs = layers.Input(shape=IMG_SIZE + (3,))
 
@@ -219,11 +233,15 @@ def build_model(num_classes: int, learning_rate: float = HEAD_LEARNING_RATE):
         name="data_augmentation",
     )
 
-    x = data_augmentation(inputs)
-    x = layers.Rescaling(1.0 / 255.0, name="rescale_1_255")(x)
+    x = inputs
+    if use_augmentation:
+        x = data_augmentation(x)
+
+    # Let EfficientNetB0 handle scaling/normalization via its preprocess_input
+    x = preprocess_input(x)
 
     # Pretrained backbone (ImageNet weights)
-    base_model = tf.keras.applications.EfficientNetB0(
+    base_model = EfficientNetB0(
         include_top=False,
         weights="imagenet",
         input_shape=IMG_SIZE + (3,),
@@ -272,15 +290,34 @@ def train_model():
         val_ds = val_ds.take(DEBUG_VAL_STEPS)
         test_ds = test_ds.take(DEBUG_VAL_STEPS)
 
+    if SANITY_OVERFIT_MODE:
+        print("SANITY_OVERFIT_MODE is ON: using tiny subset without augmentation to check overfitting.")
+
+        # Take a small subset of train/val for a quick overfit sanity check
+        train_ds = train_ds.unbatch().take(SANITY_OVERFIT_TRAIN_IMAGES).batch(BATCH_SIZE)
+        val_ds = val_ds.unbatch().take(SANITY_OVERFIT_VAL_IMAGES).batch(BATCH_SIZE)
+
+        AUTOTUNE = tf.data.AUTOTUNE
+        train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=AUTOTUNE)
+        val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
+
     # Compute class weights to handle class imbalance
     # NOTE: We compute from the (possibly trimmed) training dataset.
-    class_weight_dict = compute_class_weights_from_ds(train_ds, num_classes)
-    print("Class weights:", class_weight_dict)
+    if SANITY_OVERFIT_MODE:
+        class_weight_dict = None
+        print("SANITY_OVERFIT_MODE: skipping class weights to make overfitting easier.")
+    else:
+        class_weight_dict = compute_class_weights_from_ds(train_ds, num_classes)
+        print("Class weights:", class_weight_dict)
 
     # ------------------------
     # Stage 1: Train classifier head
     # ------------------------
-    model = build_model(num_classes, learning_rate=HEAD_LEARNING_RATE)
+    model = build_model(
+        num_classes,
+        learning_rate=HEAD_LEARNING_RATE,
+        use_augmentation=not SANITY_OVERFIT_MODE,
+    )
     model.summary(print_fn=lambda x: print("   " + x))
 
     early_stop_head = tf.keras.callbacks.EarlyStopping(
