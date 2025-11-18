@@ -67,7 +67,7 @@ BATCH_SIZE = 32
 MODEL_BACKBONE = "simple_cnn"
 
 # Two‑stage training hyperparameters (main training)
-HEAD_EPOCHS = 40               # train longer since we skip fine-tuning
+HEAD_EPOCHS = 80               # max epochs; early stopping will usually stop earlier
 HEAD_LEARNING_RATE = 1e-3
 FINE_TUNE_EPOCHS = 0           # not used when MODEL_BACKBONE = "simple_cnn"
 FINE_TUNE_LEARNING_RATE = 1e-5
@@ -79,6 +79,7 @@ FINE_TUNE_NUM_LAYERS = 80      # how many EfficientNet layers (from the end) to 
 SANITY_OVERFIT_MODE = False
 SANITY_OVERFIT_TRAIN_IMAGES = 64
 SANITY_OVERFIT_VAL_IMAGES = 64
+SANITY_LEARNING_RATE = 1e-3
 
 # Optional debug mode to train quickly on a subset of data
 DEBUG_MODE = False
@@ -306,8 +307,10 @@ def build_model(
     data_augmentation = tf.keras.Sequential(
         [
             layers.RandomFlip("horizontal"),
-            layers.RandomRotation(0.05),
-            layers.RandomZoom(0.1),
+            layers.RandomRotation(0.1),
+            layers.RandomZoom(0.2),
+            layers.RandomTranslation(0.05, 0.05),
+            layers.RandomContrast(0.1),
         ],
         name="data_augmentation",
     )
@@ -318,13 +321,24 @@ def build_model(
     x = layers.Rescaling(1.0 / 255.0, name="rescale_1_255")(x)
 
     if MODEL_BACKBONE == "simple_cnn":
-        # A smaller custom CNN backbone (no EfficientNet) for experiments
+        # A slightly deeper custom CNN backbone with BatchNorm after each conv
         x = layers.Conv2D(32, (3, 3), activation="relu", padding="same")(x)
+        x = layers.BatchNormalization()(x)
         x = layers.MaxPooling2D()(x)
+
         x = layers.Conv2D(64, (3, 3), activation="relu", padding="same")(x)
+        x = layers.BatchNormalization()(x)
         x = layers.MaxPooling2D()(x)
+
         x = layers.Conv2D(128, (3, 3), activation="relu", padding="same")(x)
+        x = layers.BatchNormalization()(x)
         x = layers.MaxPooling2D()(x)
+
+        # Extra conv block for more expressive power
+        x = layers.Conv2D(256, (3, 3), activation="relu", padding="same")(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling2D()(x)
+
         x = layers.GlobalAveragePooling2D(name="avg_pool")(x)
     else:
         # Pretrained EfficientNetB0 backbone (ImageNet weights)
@@ -432,8 +446,16 @@ def train_model():
 
         early_stop_head = tf.keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=5,
+            patience=8,
             restore_best_weights=True,
+        )
+
+        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=3,
+            verbose=1,
+            min_lr=1e-5,
         )
 
         history = model.fit(
@@ -441,7 +463,7 @@ def train_model():
             validation_data=val_ds,
             epochs=HEAD_EPOCHS,
             class_weight=class_weight_dict,
-            callbacks=[early_stop_head],
+            callbacks=[early_stop_head, reduce_lr],
         )
 
         # Stage 2: fine-tune the top part of the backbone with a low learning rate.
