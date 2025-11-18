@@ -50,17 +50,17 @@ DATA_ROOT = BASE_DIR / "data" / "pcb_defects"
 DL_MODEL_PATH = BASE_DIR / "pcb_defect_classifier.keras"
 CLASS_NAMES_PATH = BASE_DIR / "pcb_class_names.pkl"
 
-# Image / training hyperparameters
-IMG_SIZE = (224, 224)       # standard for many pretrained backbones
-BATCH_SIZE = 32
+IMG_SIZE = (380, 380)       # higher resolution to better capture tiny PCB defects
+BATCH_SIZE = 16
 EPOCHS = 15                 # kept for reference (not directly used in 2‑stage training)
 LEARNING_RATE = 1e-4        # base reference LR (not used directly)
 
 # Two‑stage training hyperparameters
-HEAD_EPOCHS = 8
-FINE_TUNE_EPOCHS = 15
-HEAD_LEARNING_RATE = 5e-4
-FINE_TUNE_LEARNING_RATE = 1e-5
+# (more aggressive to reduce underfitting)
+HEAD_EPOCHS = 20
+FINE_TUNE_EPOCHS = 25
+HEAD_LEARNING_RATE = 1e-3
+FINE_TUNE_LEARNING_RATE = 1e-4
 
 # Optional debug mode to train quickly on a subset of data
 DEBUG_MODE = False
@@ -70,9 +70,9 @@ DEBUG_VAL_STEPS = 30       # number of batches for validation when debug
 # Optional tiny overfit sanity-check mode
 # When True, we train on a very small subset of the data without augmentation
 # to verify that the model can overfit (reach very high training accuracy).
-SANITY_OVERFIT_MODE = False
-SANITY_OVERFIT_TRAIN_IMAGES = 64
-SANITY_OVERFIT_VAL_IMAGES = 64
+SANITY_OVERFIT_MODE = True
+SANITY_OVERFIT_TRAIN_IMAGES = 32
+SANITY_OVERFIT_VAL_IMAGES = 32
 
 
 # -------------
@@ -213,6 +213,7 @@ def build_model(
     num_classes: int,
     learning_rate: float = HEAD_LEARNING_RATE,
     use_augmentation: bool = True,
+    backbone_trainable: bool = False,
 ):
     """Build a CNN-based image classifier using a pretrained EfficientNetB0 backbone.
 
@@ -247,14 +248,15 @@ def build_model(
         input_shape=IMG_SIZE + (3,),
         pooling=None,
     )
-    base_model.trainable = False  # start with frozen backbone for stability
+    base_model.trainable = backbone_trainable  # optionally start with frozen backbone for stability
 
     x = base_model(x, training=False)
     x = layers.GlobalAveragePooling2D(name="avg_pool")(x)
 
     # Classification head
     x = layers.Dense(256, activation="relu")(x)
-    x = layers.Dropout(0.5)(x)
+    # Slightly lower dropout to let the model fit the small dataset more easily
+    x = layers.Dropout(0.3)(x)
     outputs = layers.Dense(num_classes, activation="softmax")(x)
 
     model = models.Model(inputs=inputs, outputs=outputs)
@@ -301,6 +303,17 @@ def train_model():
         train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=AUTOTUNE)
         val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
 
+    # Decide training settings based on sanity overfit mode
+    if SANITY_OVERFIT_MODE:
+        # In sanity mode, train the whole backbone with a higher learning rate
+        backbone_trainable_flag = True
+        head_lr = 1e-3
+        head_epochs = 40
+    else:
+        backbone_trainable_flag = False
+        head_lr = HEAD_LEARNING_RATE
+        head_epochs = HEAD_EPOCHS
+
     # Compute class weights to handle class imbalance
     # NOTE: We compute from the (possibly trimmed) training dataset.
     if SANITY_OVERFIT_MODE:
@@ -315,8 +328,9 @@ def train_model():
     # ------------------------
     model = build_model(
         num_classes,
-        learning_rate=HEAD_LEARNING_RATE,
+        learning_rate=head_lr,
         use_augmentation=not SANITY_OVERFIT_MODE,
+        backbone_trainable=backbone_trainable_flag,
     )
     model.summary(print_fn=lambda x: print("   " + x))
 
@@ -330,7 +344,7 @@ def train_model():
     history_head = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=HEAD_EPOCHS,
+        epochs=head_epochs,
         class_weight=class_weight_dict,
         callbacks=[early_stop_head],
     )
@@ -338,42 +352,45 @@ def train_model():
     # ------------------------
     # Stage 2: Fine-tune top EfficientNet blocks
     # ------------------------
-    base_model = model.get_layer("efficientnetb0")
-    base_model.trainable = True
+    if not SANITY_OVERFIT_MODE:
+        base_model = model.get_layer("efficientnetb0")
+        base_model.trainable = True
 
-    # Freeze earlier layers, unfreeze only last ~50 layers for fine-tuning
-    fine_tune_at = max(0, len(base_model.layers) - 50)
-    for layer in base_model.layers[:fine_tune_at]:
-        layer.trainable = False
+        # Freeze earlier layers, unfreeze only last ~100 layers for fine-tuning
+        fine_tune_at = max(0, len(base_model.layers) - 100)
+        for layer in base_model.layers[:fine_tune_at]:
+            layer.trainable = False
 
-    print(f"Unfreezing EfficientNet from layer index {fine_tune_at} (of {len(base_model.layers)}) for fine-tuning.")
+        print(f"Unfreezing EfficientNet from layer index {fine_tune_at} (of {len(base_model.layers)}) for fine-tuning.")
 
-    # Recompile with a lower learning rate for fine-tuning
-    optimizer_fine = tf.keras.optimizers.Adam(learning_rate=FINE_TUNE_LEARNING_RATE)
-    model.compile(
-        loss="sparse_categorical_crossentropy",
-        optimizer=optimizer_fine,
-        metrics=["accuracy"],
-    )
+        # Recompile with a lower learning rate for fine-tuning
+        optimizer_fine = tf.keras.optimizers.Adam(learning_rate=FINE_TUNE_LEARNING_RATE)
+        model.compile(
+            loss="sparse_categorical_crossentropy",
+            optimizer=optimizer_fine,
+            metrics=["accuracy"],
+        )
 
-    early_stop_fine = tf.keras.callbacks.EarlyStopping(
-        monitor="val_loss",
-        patience=5,
-        restore_best_weights=True,
-    )
+        early_stop_fine = tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=5,
+            restore_best_weights=True,
+        )
 
-    print("\n🛠 Stage 2: fine-tuning top EfficientNet layers...")
-    total_epochs = HEAD_EPOCHS + FINE_TUNE_EPOCHS
-    # Continue training from where Stage 1 left off
-    initial_epoch = history_head.epoch[-1] + 1 if hasattr(history_head, "epoch") else HEAD_EPOCHS
-    history_fine = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=total_epochs,
-        initial_epoch=initial_epoch,
-        class_weight=class_weight_dict,
-        callbacks=[early_stop_fine],
-    )
+        print("\n🛠 Stage 2: fine-tuning top EfficientNet layers...")
+        total_epochs = HEAD_EPOCHS + FINE_TUNE_EPOCHS
+        # Continue training from where Stage 1 left off
+        initial_epoch = history_head.epoch[-1] + 1 if hasattr(history_head, "epoch") else HEAD_EPOCHS
+        history_fine = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=total_epochs,
+            initial_epoch=initial_epoch,
+            class_weight=class_weight_dict,
+            callbacks=[early_stop_fine],
+        )
+    else:
+        print("\nSkipping Stage 2 fine-tuning in SANITY_OVERFIT_MODE.")
 
     # Evaluate on validation set and print classification report
     print("\n📊 Evaluating on validation set...")
