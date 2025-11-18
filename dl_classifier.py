@@ -46,32 +46,43 @@ BASE_DIR = Path(__file__).resolve().parent
 # In Colab we set this up as: /content/ECE570FinalProject/data/pcb_defects
 DATA_ROOT = BASE_DIR / "data" / "pcb_defects"
 
+# Optional alternate root if you create cropped defect patches
+PATCH_DATA_ROOT = BASE_DIR / "data" / "pcb_patches"
+
 # Model + metadata save paths
 DL_MODEL_PATH = BASE_DIR / "pcb_defect_classifier.keras"
 CLASS_NAMES_PATH = BASE_DIR / "pcb_class_names.pkl"
 
+# Optional: where to save per-class feature centroids for anomaly detection
+CENTROIDS_PATH = BASE_DIR / "pcb_class_centroids.npy"
+
 # Image / training hyperparameters
 IMG_SIZE = (224, 224)       # EfficientNetB0 default input size
 BATCH_SIZE = 32
-EPOCHS = 15                 # kept for reference (not directly used in 2‑stage training)
-LEARNING_RATE = 1e-4        # base reference LR (not used directly)
 
-# Single‑stage training hyperparameters
-MAIN_EPOCHS = 40
-MAIN_LEARNING_RATE = 1e-4
-SANITY_LEARNING_RATE = 1e-3
+# Backbone / architecture choice
+#   "efficientnet" (default): EfficientNetB0 backbone
+#   "simple_cnn"            : small custom CNN backbone (for experiments)
+MODEL_BACKBONE = "efficientnet"
+
+# Two‑stage training hyperparameters (main training)
+HEAD_EPOCHS = 10               # train only classifier head first
+HEAD_LEARNING_RATE = 1e-3
+FINE_TUNE_EPOCHS = 30          # additional epochs with partial backbone unfrozen
+FINE_TUNE_LEARNING_RATE = 1e-5
+FINE_TUNE_NUM_LAYERS = 80      # how many EfficientNet layers (from the end) to unfreeze
+
+# Optional tiny overfit sanity‑check mode
+# When True, we train on a very small subset of the data without augmentation
+# to verify that the model can overfit (reach very high training accuracy).
+SANITY_OVERFIT_MODE = False
+SANITY_OVERFIT_TRAIN_IMAGES = 64
+SANITY_OVERFIT_VAL_IMAGES = 64
 
 # Optional debug mode to train quickly on a subset of data
 DEBUG_MODE = False
 DEBUG_TRAIN_STEPS = 100    # number of batches for training when debug
 DEBUG_VAL_STEPS = 30       # number of batches for validation when debug
-
-# Optional tiny overfit sanity-check mode
-# When True, we train on a very small subset of the data without augmentation
-# to verify that the model can overfit (reach very high training accuracy).
-SANITY_OVERFIT_MODE = True
-SANITY_OVERFIT_TRAIN_IMAGES = 64
-SANITY_OVERFIT_VAL_IMAGES = 64
 
 
 # -------------
@@ -103,15 +114,24 @@ def build_datasets():
     If your Kaggle dataset uses a slightly different naming scheme (e.g., "valid" instead of
     "val"), adjust the directory names below accordingly.
     """
-    if not DATA_ROOT.exists():
+    # You can switch to a cropped‑patch dataset by changing this root.
+    # By default we use the full‑image dataset under DATA_ROOT.
+    data_root = DATA_ROOT
+    if PATCH_DATA_ROOT.exists():
+        # If you create cropped patches, you can point to PATCH_DATA_ROOT instead.
+        # Uncomment the next line once you have data/pcb_patches prepared.
+        # data_root = PATCH_DATA_ROOT
+        pass
+
+    if not data_root.exists():
         raise FileNotFoundError(
-            f"DATA_ROOT does not exist: {DATA_ROOT}. "
+            f"DATA_ROOT does not exist: {data_root}. "
             "Make sure you downloaded the Kaggle PCB dataset and placed/symlinked it as data/pcb_defects."
         )
 
-    train_dir = DATA_ROOT / "train"
-    val_dir = DATA_ROOT / "val"
-    test_dir = DATA_ROOT / "test"
+    train_dir = data_root / "train"
+    val_dir = data_root / "val"
+    test_dir = data_root / "test"
 
     if not train_dir.exists():
         raise FileNotFoundError(f"Train dir not found: {train_dir}")
@@ -204,13 +224,70 @@ def compute_class_weights_from_ds(dataset, num_classes):
     return class_weight_dict
 
 
+# -----------------------------
+# Feature extractor / centroids
+# -----------------------------
+
+def build_feature_extractor(trained_model: tf.keras.Model) -> tf.keras.Model:
+    """
+    Wrap the trained model to output embeddings from the 'feature_dense' layer.
+    """
+    try:
+        feature_layer = trained_model.get_layer("feature_dense")
+    except ValueError as e:
+        raise ValueError(
+            "Model does not contain a layer named 'feature_dense'. "
+            "Make sure build_model defines a Dense layer with name='feature_dense'."
+        ) from e
+
+    feature_extractor = models.Model(
+        inputs=trained_model.input,
+        outputs=feature_layer.output,
+    )
+    return feature_extractor
+
+
+def compute_class_centroids(feature_extractor: tf.keras.Model, dataset, num_classes: int):
+    """
+    Compute per-class centroids in feature space by averaging embeddings
+    from the training dataset.
+
+    Returns a dict: {class_index: centroid_vector}.
+    """
+    # We don't know feature dim up front; infer it from first batch.
+    sums = None
+    counts = np.zeros(num_classes, dtype=np.int64)
+
+    for images, labels in dataset:
+        feats = feature_extractor.predict(images, verbose=0)
+        if sums is None:
+            sums = np.zeros((num_classes, feats.shape[1]), dtype=np.float64)
+
+        labels_np = labels.numpy()
+        for f, l in zip(feats, labels_np):
+            sums[l] += f
+            counts[l] += 1
+
+    centroids = {}
+    if sums is None:
+        return centroids  # empty dataset
+
+    for c in range(num_classes):
+        if counts[c] > 0:
+            centroids[c] = (sums[c] / counts[c]).astype(np.float32)
+        else:
+            centroids[c] = None  # no examples for this class
+
+    return centroids
+
+
 # -------------
 # Model building
 # -------------
 
 def build_model(
     num_classes: int,
-    learning_rate: float = MAIN_LEARNING_RATE,
+    learning_rate: float = HEAD_LEARNING_RATE,
     use_augmentation: bool = True,
     backbone_trainable: bool = True,
 ):
@@ -219,6 +296,10 @@ def build_model(
     This version uses a Rescaling layer to scale images to [0, 1] before feeding to EfficientNet.
     Allows turning data augmentation on/off and controlling EfficientNet trainability.
     """
+    # MODEL_BACKBONE controls which backbone we use:
+    #  - "efficientnet": EfficientNetB0 pretrained on ImageNet
+    #  - "simple_cnn" : a smaller custom CNN for debugging/experiments
+
     inputs = layers.Input(shape=IMG_SIZE + (3,))
 
     # Data augmentation pipeline applied only during training
@@ -236,20 +317,29 @@ def build_model(
         x = data_augmentation(x)
     x = layers.Rescaling(1.0 / 255.0, name="rescale_1_255")(x)
 
-    # Pretrained backbone (ImageNet weights)
-    base_model = EfficientNetB0(
-        include_top=False,
-        weights="imagenet",
-        input_shape=IMG_SIZE + (3,),
-        pooling=None,
-    )
-    base_model.trainable = backbone_trainable
+    if MODEL_BACKBONE == "simple_cnn":
+        # A smaller custom CNN backbone (no EfficientNet) for experiments
+        x = layers.Conv2D(32, (3, 3), activation="relu", padding="same")(x)
+        x = layers.MaxPooling2D()(x)
+        x = layers.Conv2D(64, (3, 3), activation="relu", padding="same")(x)
+        x = layers.MaxPooling2D()(x)
+        x = layers.Conv2D(128, (3, 3), activation="relu", padding="same")(x)
+        x = layers.MaxPooling2D()(x)
+        x = layers.GlobalAveragePooling2D(name="avg_pool")(x)
+    else:
+        # Pretrained EfficientNetB0 backbone (ImageNet weights)
+        base_model = EfficientNetB0(
+            include_top=False,
+            weights="imagenet",
+            input_shape=IMG_SIZE + (3,),
+            pooling=None,
+        )
+        base_model.trainable = backbone_trainable
+        x = base_model(x, training=False)
+        x = layers.GlobalAveragePooling2D(name="avg_pool")(x)
 
-    x = base_model(x, training=False)
-    x = layers.GlobalAveragePooling2D(name="avg_pool")(x)
-
-    # Classification head
-    x = layers.Dense(256, activation="relu")(x)
+    # Classification head with an explicitly named feature layer
+    x = layers.Dense(256, activation="relu", name="feature_dense")(x)
     x = layers.Dropout(0.5)(x)
     outputs = layers.Dense(num_classes, activation="softmax")(x)
 
@@ -307,10 +397,10 @@ def train_model():
         print("Class weights:", class_weight_dict)
 
     # ------------------------
-    # Single-stage training (optionally with sanity overfit mode)
+    # Training
     # ------------------------
     if SANITY_OVERFIT_MODE:
-        # In sanity mode we want to see if the model can overfit a tiny subset.
+        # In sanity mode we want to overfit a tiny subset.
         # Use no augmentation, higher learning rate, and no early stopping.
         model = build_model(
             num_classes,
@@ -329,29 +419,67 @@ def train_model():
             class_weight=None,  # make it easier to overfit
         )
     else:
-        # Main training: full train/val, full backbone trainable, moderate LR with early stopping
+        # Main training: two stages.
+        # Stage 1: train only the classification head with EfficientNet frozen.
+        print("\n🚀 Stage 1: training classifier head with frozen backbone...")
         model = build_model(
             num_classes,
-            learning_rate=MAIN_LEARNING_RATE,
+            learning_rate=HEAD_LEARNING_RATE,
             use_augmentation=True,
-            backbone_trainable=True,
+            backbone_trainable=False,   # freeze EfficientNet backbone
         )
         model.summary(print_fn=lambda x: print("   " + x))
 
-        early_stop_main = tf.keras.callbacks.EarlyStopping(
+        early_stop_head = tf.keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=8,
+            patience=5,
             restore_best_weights=True,
         )
 
-        print("\n🚀 Main training: full EfficientNet backbone trainable...")
         history = model.fit(
             train_ds,
             validation_data=val_ds,
-            epochs=MAIN_EPOCHS,
+            epochs=HEAD_EPOCHS,
             class_weight=class_weight_dict,
-            callbacks=[early_stop_main],
+            callbacks=[early_stop_head],
         )
+
+        # Stage 2: fine-tune the top part of the backbone with a low learning rate.
+        if MODEL_BACKBONE == "efficientnet":
+            print(f"\n🛠 Stage 2: fine-tuning top {FINE_TUNE_NUM_LAYERS} EfficientNet layers...")
+            try:
+                base_model = model.get_layer("efficientnetb0")
+                for layer in base_model.layers[-FINE_TUNE_NUM_LAYERS:]:
+                    layer.trainable = True
+            except ValueError:
+                print("⚠️ Could not find 'efficientnetb0' layer; skipping fine-tuning stage.")
+            else:
+                # Recompile with a lower learning rate for fine-tuning
+                fine_tune_optimizer = tf.keras.optimizers.Adam(
+                    learning_rate=FINE_TUNE_LEARNING_RATE
+                )
+                model.compile(
+                    loss="sparse_categorical_crossentropy",
+                    optimizer=fine_tune_optimizer,
+                    metrics=["accuracy"],
+                )
+
+                early_stop_ft = tf.keras.callbacks.EarlyStopping(
+                    monitor="val_loss",
+                    patience=8,
+                    restore_best_weights=True,
+                )
+
+                model.fit(
+                    train_ds,
+                    validation_data=val_ds,
+                    epochs=HEAD_EPOCHS + FINE_TUNE_EPOCHS,
+                    initial_epoch=HEAD_EPOCHS,
+                    class_weight=class_weight_dict,
+                    callbacks=[early_stop_ft],
+                )
+        else:
+            print("\nℹ️ MODEL_BACKBONE != 'efficientnet'; skipping fine-tuning stage.")
 
     # Evaluate on validation set and print classification report
     print("\n📊 Evaluating on validation set...")
@@ -412,6 +540,16 @@ def train_model():
     print(f"\n✅ PCB defect model saved to: {DL_MODEL_PATH}")
     print(f"✅ Class names saved to: {CLASS_NAMES_PATH}")
 
+    # Optionally compute and save class centroids in feature space for anomaly-style detection.
+    try:
+        print("\n📐 Computing per-class feature centroids for anomaly detection...")
+        feature_extractor = build_feature_extractor(model)
+        centroids = compute_class_centroids(feature_extractor, train_ds, num_classes)
+        np.save(CENTROIDS_PATH, centroids, allow_pickle=True)
+        print(f"✅ Class centroids saved to: {CENTROIDS_PATH}")
+    except Exception as e:
+        print(f"⚠️ Could not compute/save class centroids: {e}")
+
 
 # -------------
 # Inference helper
@@ -450,6 +588,74 @@ def predict_single_image(image_path: str):
 
     predicted_label = class_names[pred_idx]
     return predicted_label, confidence
+
+
+def predict_single_image_with_anomaly(image_path: str, anomaly_threshold: float = 10.0):
+    """
+    Predict a single PCB image and also compute a simple anomaly score based on
+    distance to per-class centroids in feature space.
+
+    Returns a dict with:
+        - predicted_label (softmax)
+        - softmax_confidence
+        - nearest_centroid_label
+        - nearest_centroid_distance
+        - is_anomaly (bool)
+    """
+    if not DL_MODEL_PATH.exists() or not CLASS_NAMES_PATH.exists() or not CENTROIDS_PATH.exists():
+        raise FileNotFoundError(
+            "Model, class names, or centroids file not found. "
+            "Train the model first by running this script normally."
+        )
+
+    # Load model, class names, and centroids
+    model = tf.keras.models.load_model(DL_MODEL_PATH)
+    class_names = joblib.load(CLASS_NAMES_PATH)
+    centroids = np.load(CENTROIDS_PATH, allow_pickle=True).item()
+    feature_extractor = build_feature_extractor(model)
+
+    # Load and preprocess image (same as predict_single_image)
+    img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+    x = tf.keras.utils.img_to_array(img)
+    x = np.expand_dims(x, axis=0)
+    x = x.astype("float32")
+
+    # Softmax prediction
+    probs = model.predict(x, verbose=0)[0]
+    pred_idx = int(np.argmax(probs))
+    confidence = float(probs[pred_idx])
+
+    # Feature embedding
+    feat = feature_extractor.predict(x, verbose=0)[0]
+
+    # Distance to each centroid
+    distances = {}
+    for c, centroid in centroids.items():
+        if centroid is None:
+            continue
+        distances[int(c)] = float(np.linalg.norm(feat - centroid))
+
+    if not distances:
+        # No centroids available; fall back to pure softmax prediction
+        return {
+            "predicted_label": class_names[pred_idx],
+            "softmax_confidence": confidence,
+            "nearest_centroid_label": class_names[pred_idx],
+            "nearest_centroid_distance": None,
+            "is_anomaly": False,
+        }
+
+    best_class = min(distances, key=distances.get)
+    best_dist = distances[best_class]
+    is_anomaly = best_dist > anomaly_threshold
+
+    return {
+        "predicted_label": class_names[pred_idx],
+        "softmax_confidence": confidence,
+        "nearest_centroid_label": class_names[best_class],
+        "nearest_centroid_distance": best_dist,
+        "is_anomaly": is_anomaly,
+    }
 
 
 if __name__ == "__main__":
