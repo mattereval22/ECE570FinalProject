@@ -17,9 +17,7 @@ VECTORIZER_PATH = BASE_DIR / "hdl_vectorizer.pkl"
 
 def train_model():
     print("🔧 Training HDL Bug Classifier...")
-    print("CWD:", os.getcwd())
-    print("BASE_DIR:", BASE_DIR)
-    print("TRAIN_PATH:", TRAIN_PATH)
+
     train_df = pd.read_csv(TRAIN_PATH)
     test_df = pd.read_csv(TEST_PATH)
 
