@@ -42,12 +42,12 @@ except Exception as e:
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Root directory where the Kaggle PCB defects dataset is linked.
-# In Colab we set this up as: /content/ECE570FinalProject/data/pcb_defects
-DATA_ROOT = BASE_DIR / "data" / "pcb_defects"
+# Root directory where the **cropped defect patch** dataset is linked.
+# In Colab we set this up as: /content/ECE570FinalProject/data/pcb_patches
+DATA_ROOT = BASE_DIR / "data" / "pcb_patches"
 
-# Optional alternate root if you create cropped defect patches
-PATCH_DATA_ROOT = BASE_DIR / "data" / "pcb_patches"
+# Optional alternate root if you also keep the original full-board images
+BOARD_DATA_ROOT = BASE_DIR / "data" / "pcb_defects"
 
 # Model + metadata save paths
 DL_MODEL_PATH = BASE_DIR / "pcb_defect_classifier.keras"
@@ -114,14 +114,13 @@ def build_datasets():
     If your Kaggle dataset uses a slightly different naming scheme (e.g., "valid" instead of
     "val"), adjust the directory names below accordingly.
     """
-    # You can switch to a cropped‑patch dataset by changing this root.
-    # By default we use the full‑image dataset under DATA_ROOT.
+    # DATA_ROOT now points to the default training dataset (cropped patches).
+    # If that folder is missing but BOARD_DATA_ROOT exists, fall back to boards.
     data_root = DATA_ROOT
-    if PATCH_DATA_ROOT.exists():
-        # If you create cropped patches, you can point to PATCH_DATA_ROOT instead.
-        # Uncomment the next line once you have data/pcb_patches prepared.
-        # data_root = PATCH_DATA_ROOT
-        pass
+    if not data_root.exists() and "BOARD_DATA_ROOT" in globals():
+        if BOARD_DATA_ROOT.exists():
+            print(f"⚠️ {data_root} not found, falling back to board dataset at {BOARD_DATA_ROOT}")
+            data_root = BOARD_DATA_ROOT
 
     if not data_root.exists():
         raise FileNotFoundError(
