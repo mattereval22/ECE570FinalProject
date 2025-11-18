@@ -3,7 +3,7 @@ import os
 import joblib
 import numpy as np
 
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 
 import tensorflow as tf
@@ -282,6 +282,50 @@ def compute_class_centroids(feature_extractor: tf.keras.Model, dataset, num_clas
     return centroids
 
 
+# ----------------------
+# Confusion matrix utils
+# ----------------------
+
+def print_confusion_matrix(cm, class_names, title="Confusion matrix"):
+    """
+    Nicely print a confusion matrix as a text table.
+    cm: 2D numpy array (num_classes x num_classes)
+    class_names: list of class name strings in index order
+    """
+    num_classes = len(class_names)
+    print(f"\n{title}")
+    header = " " * 15 + " ".join(f"{name[:7]:>7}" for name in class_names)
+    print(header)
+    for i in range(num_classes):
+        row_vals = " ".join(f"{int(v):7d}" for v in cm[i])
+        print(f"{class_names[i][:13]:>13} {row_vals}")
+
+def summarize_confusions(cm, class_names, top_k=5):
+    """
+    Summarize the most common off-diagonal confusions.
+    """
+    num_classes = len(class_names)
+    confusions = []
+    for i in range(num_classes):
+        for j in range(num_classes):
+            if i == j:
+                continue
+            count = int(cm[i, j])
+            if count > 0:
+                confusions.append((count, i, j))
+
+    if not confusions:
+        print("\nNo off-diagonal confusions (perfect classification on this split).")
+        return
+
+    confusions.sort(reverse=True, key=lambda x: x[0])
+    print(f"\nTop {min(top_k, len(confusions))} confusions (true → predicted):")
+    for count, i, j in confusions[:top_k]:
+        print(
+            f"  {class_names[i]} → {class_names[j]}: {count} samples"
+        )
+
+
 # -------------
 # Model building
 # -------------
@@ -528,6 +572,10 @@ def train_model():
             zero_division=0,
         )
     )
+    # Confusion matrix for validation set
+    cm_val = confusion_matrix(y_true, y_pred, labels=np.arange(num_classes))
+    print_confusion_matrix(cm_val, class_names, title="Validation Confusion Matrix")
+    summarize_confusions(cm_val, class_names, top_k=5)
 
     # Evaluate on held-out test set
     print("\n📊 Evaluating on TEST set...")
@@ -554,6 +602,10 @@ def train_model():
             zero_division=0,
         )
     )
+    # Confusion matrix for test set
+    cm_test = confusion_matrix(y_true_test, y_pred_test, labels=np.arange(num_classes))
+    print_confusion_matrix(cm_test, class_names, title="Test Confusion Matrix")
+    summarize_confusions(cm_test, class_names, top_k=5)
 
     # Save model + class names
     model.save(DL_MODEL_PATH)
