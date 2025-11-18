@@ -2,15 +2,11 @@ from pathlib import Path
 import os
 import joblib
 import numpy as np
-import pandas as pd
 
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.utils.class_weight import compute_class_weight
 
 import tensorflow as tf
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras import layers, models
 
 # -----------------------
@@ -19,248 +15,320 @@ from tensorflow.keras import layers, models
 
 BASE_DIR = Path(__file__).resolve().parent
 
-TRAIN_PATH = BASE_DIR / "hdl_train.csv"
-TEST_PATH = BASE_DIR / "hdl_test.csv"
+# Root directory where the Kaggle PCB defects dataset is linked.
+# In Colab we set this up as: /content/ECE570FinalProject/data/pcb_defects
+DATA_ROOT = BASE_DIR / "data" / "pcb_defects"
 
-DL_MODEL_PATH = BASE_DIR / "dl_bug_classifier.keras"
-TOKENIZER_PATH = BASE_DIR / "dl_tokenizer.pkl"
+# Model + metadata save paths
+DL_MODEL_PATH = BASE_DIR / "pcb_defect_classifier.keras"
+CLASS_NAMES_PATH = BASE_DIR / "pcb_class_names.pkl"
 
-# Hyperparameters
-MAX_VOCAB = 20000        # max number of tokens in vocab
-# Use a large but more manageable max sequence length so the model
-# still sees most files without making training intractable.
-# This reduces padding and makes optimization easier than 9000 tokens.
-MAX_LEN   = 1536         # effective max sequence length
-EMB_DIM   = 128          # embedding dimension
-LSTM_UNITS = 128         # BiLSTM units
-# Slightly larger batch size now that sequences are shorter
+# Image / training hyperparameters
+IMG_SIZE = (224, 224)       # standard for many pretrained backbones
 BATCH_SIZE = 32
-EPOCHS     = 10
-DECISION_THRESHOLD = 0.5
+EPOCHS = 15
+LEARNING_RATE = 1e-4
 
-# Optional "debug" mode for lighter experiments in Colab.
-# When DEBUG_MODE is True, training will use only a fraction of the
-# training set and fewer epochs to save compute.
+# Optional debug mode to train quickly on a subset of data
 DEBUG_MODE = False
-DEBUG_FRACTION = 0.3   # use 30% of the training set in debug mode
-DEBUG_EPOCHS = 15       # train for fewer epochs in debug mode
+DEBUG_TRAIN_STEPS = 100    # number of batches for training when debug
+DEBUG_VAL_STEPS = 30       # number of batches for validation when debug
 
 
 # -------------
 # Data loading
 # -------------
 
-def load_data(csv_path: Path):
-    """Load tokens and labels from CSV and convert labels to 0/1."""
-    df = pd.read_csv(csv_path)
+def build_datasets():
+    """
+    Build tf.data datasets for training, validation, and test from directories of images.
 
-    # tokens column is assumed to be a string of space-separated tokens
-    texts = df["tokens"].astype(str).tolist()
+    Expected directory structure under DATA_ROOT:
+        pcb_defects/
+            train/
+                class_0_name/
+                    img001.png
+                    ...
+                class_1_name/
+                    ...
+                ...
+            val/
+                class_0_name/
+                    ...
+                ...
+            test/
+                class_0_name/
+                    ...
+                ...
 
-    # Map labels to integers: clean -> 0, bug -> 1
-    label_map = {"clean": 0, "bug": 1}
-    labels = df["label"].map(label_map).values
+    If your Kaggle dataset uses a slightly different naming scheme (e.g., "valid" instead of
+    "val"), adjust the directory names below accordingly.
+    """
+    if not DATA_ROOT.exists():
+        raise FileNotFoundError(
+            f"DATA_ROOT does not exist: {DATA_ROOT}. "
+            "Make sure you downloaded the Kaggle PCB dataset and placed/symlinked it as data/pcb_defects."
+        )
 
-    return texts, labels
+    train_dir = DATA_ROOT / "train"
+    val_dir = DATA_ROOT / "val"
+    test_dir = DATA_ROOT / "test"
 
+    if not train_dir.exists():
+        raise FileNotFoundError(f"Train dir not found: {train_dir}")
+    if not val_dir.exists():
+        raise FileNotFoundError(f"Val dir not found: {val_dir}")
+    if not test_dir.exists():
+        raise FileNotFoundError(f"Test dir not found: {test_dir}")
 
-def prepare_sequences(train_texts, test_texts):
-    """Fit tokenizer on train_texts and convert train/test to padded sequences."""
-    tokenizer = Tokenizer(num_words=MAX_VOCAB, oov_token="<UNK>")
-    tokenizer.fit_on_texts(train_texts)
+    print(f"Using TRAIN_DIR = {train_dir}")
+    print(f"Using VAL_DIR   = {val_dir}")
+    print(f"Using TEST_DIR  = {test_dir}")
 
-    train_seqs = tokenizer.texts_to_sequences(train_texts)
-    test_seqs = tokenizer.texts_to_sequences(test_texts)
-
-    X_train = pad_sequences(
-        train_seqs, maxlen=MAX_LEN, padding="post", truncating="post"
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        train_dir,
+        labels="inferred",
+        label_mode="int",
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
     )
-    X_test = pad_sequences(
-        test_seqs, maxlen=MAX_LEN, padding="post", truncating="post"
+
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        val_dir,
+        labels="inferred",
+        label_mode="int",
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
     )
 
-    return X_train, X_test, tokenizer
+    test_ds = tf.keras.utils.image_dataset_from_directory(
+        test_dir,
+        labels="inferred",
+        label_mode="int",
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+    )
+
+    class_names = train_ds.class_names
+    print("Class names:", class_names)
+
+    # (Optional) sanity check that val/test have the same classes
+    if val_ds.class_names != class_names:
+        print("⚠️ Warning: val_ds.class_names differ from train_ds.class_names")
+        print("  train:", class_names)
+        print("  val  :", val_ds.class_names)
+    if test_ds.class_names != class_names:
+        print("⚠️ Warning: test_ds.class_names differ from train_ds.class_names")
+        print("  train:", class_names)
+        print("  test :", test_ds.class_names)
+
+    # Cache + prefetch for performance
+    AUTOTUNE = tf.data.AUTOTUNE
+    train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=AUTOTUNE)
+    val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
+    test_ds = test_ds.cache().prefetch(buffer_size=AUTOTUNE)
+
+    return train_ds, val_ds, test_ds, class_names
+
+
+# ----------------
+# Class weight util
+# ----------------
+
+def compute_class_weights_from_ds(dataset, num_classes):
+    """
+    Compute class weights from a (image, label) dataset by iterating through it once.
+    """
+    counts = np.zeros(num_classes, dtype=np.int64)
+    for _, labels in dataset.unbatch():
+        labels_np = labels.numpy()
+        if labels_np.ndim == 0:
+            counts[labels_np] += 1
+        else:
+            for l in labels_np:
+                counts[l] += 1
+
+    total = counts.sum()
+    print("Label counts:", counts.tolist())
+
+    # Use sklearn's balanced weighting formula
+    classes = np.arange(num_classes)
+    weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=np.repeat(classes, counts),
+    )
+    class_weight_dict = {int(c): float(w) for c, w in zip(classes, weights)}
+    return class_weight_dict
 
 
 # -------------
 # Model building
 # -------------
 
-def build_model():
-    """Build a deeper CNN + BiLSTM + Multi-Head Attention model."""
-    inputs = layers.Input(shape=(MAX_LEN,), dtype="int32")
+def build_model(num_classes: int):
+    """
+    Build a CNN-based image classifier using a pretrained EfficientNetB0 backbone.
+    """
+    inputs = layers.Input(shape=IMG_SIZE + (3,))
 
-    # 1) Token embedding
-    x = layers.Embedding(
-        input_dim=MAX_VOCAB,
-        output_dim=EMB_DIM,
-    )(inputs)
+    # Basic rescaling
+    x = layers.Rescaling(1.0 / 255)(inputs)
 
-    # 2) Two Conv1D + MaxPooling blocks to capture local n-gram patterns
-    x = layers.Conv1D(
-        filters=128,
-        kernel_size=5,
-        activation="relu",
-        padding="same",
-    )(x)
-    x = layers.MaxPooling1D(pool_size=2)(x)
+    # Pretrained backbone (ImageNet weights)
+    base_model = tf.keras.applications.EfficientNetB0(
+        include_top=False,
+        input_tensor=x,
+        pooling="avg",
+        weights="imagenet",
+    )
+    base_model.trainable = False  # start with frozen backbone for stability
 
-    x = layers.Conv1D(
-        filters=128,
-        kernel_size=5,
-        activation="relu",
-        padding="same",
-    )(x)
-    x = layers.MaxPooling1D(pool_size=2)(x)
-
-    # 3) BiLSTM over the convolved features (keep sequence for attention)
-    x = layers.Bidirectional(
-        layers.LSTM(LSTM_UNITS, return_sequences=True)
-    )(x)
-
-    # 4) Multi-Head Self-Attention to let the model focus on important timesteps
-    attn_output = layers.MultiHeadAttention(num_heads=4, key_dim=LSTM_UNITS)(x, x)
-    x = layers.Add()([x, attn_output])
-    x = layers.LayerNormalization(epsilon=1e-6)(x)
-
-    # 5) Global pooling + dense head
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(128, activation="relu")(x)
+    # Classification head
+    x = layers.Dense(256, activation="relu")(base_model.output)
     x = layers.Dropout(0.5)(x)
-    outputs = layers.Dense(1, activation="sigmoid")(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
 
     model = models.Model(inputs=inputs, outputs=outputs)
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
     model.compile(
-        loss="binary_crossentropy",
+        loss="sparse_categorical_crossentropy",
         optimizer=optimizer,
         metrics=["accuracy"],
     )
 
     return model
 
+
 # -------------
 # Training loop
 # -------------
 
-
 def train_model():
-    print("🔧 Training DL HDL Bug Classifier (CNN + BiLSTM)...")
+    print("🔧 Training PCB Defect Classifier (CNN + EfficientNet)...")
     print("CWD:", os.getcwd())
     print("BASE_DIR:", BASE_DIR)
-    print("TRAIN_PATH:", TRAIN_PATH)
-    print("TEST_PATH:", TEST_PATH)
+    print("DATA_ROOT:", DATA_ROOT)
 
-    # Load data (tokens + labels) from CSV
-    train_texts, train_labels = load_data(TRAIN_PATH)
-    test_texts,  test_labels  = load_data(TEST_PATH)
+    # Build datasets (now using explicit train/val/test splits)
+    train_ds, val_ds, test_ds, class_names = build_datasets()
+    num_classes = len(class_names)
 
-    # Optional debug subsampling to speed up experiments
+    # Optionally trim datasets for debug mode
     if DEBUG_MODE:
-        n_debug = int(len(train_texts) * DEBUG_FRACTION)
-        train_texts = train_texts[:n_debug]
-        train_labels = train_labels[:n_debug]
-        print(f"DEBUG_MODE is ON: using first {n_debug} training examples "
-              f"({DEBUG_FRACTION:.0%} of the original)")
+        print("DEBUG_MODE is ON: limiting number of batches for quick experiments.")
+        train_ds = train_ds.take(DEBUG_TRAIN_STEPS)
+        val_ds = val_ds.take(DEBUG_VAL_STEPS)
+        test_ds = test_ds.take(DEBUG_VAL_STEPS)
 
-    # Split train into train/val at the TEXT level
-    X_train_texts, X_val_texts, y_train, y_val = train_test_split(
-        train_texts,
-        train_labels,
-        test_size=0.2,
-        random_state=42,
-        stratify=train_labels,
-    )
-
-    # ---- Fit ONE tokenizer on *training* texts ----
-    tokenizer = Tokenizer(num_words=MAX_VOCAB, oov_token="<UNK>")
-    tokenizer.fit_on_texts(X_train_texts)
-
-    def texts_to_padded(texts):
-        seqs = tokenizer.texts_to_sequences(texts)
-        return pad_sequences(
-            seqs, maxlen=MAX_LEN, padding="post", truncating="post"
-        )
-
-    # Convert all splits using the SAME tokenizer
-    X_train = texts_to_padded(X_train_texts)
-    X_val   = texts_to_padded(X_val_texts)
-    X_test  = texts_to_padded(test_texts)
-
-    y_train = np.array(y_train)
-    y_val   = np.array(y_val)
-    y_test  = np.array(test_labels)
-
-    # Compute class weights so bugs are not ignored
-    classes = np.array([0, 1])  # 0 = clean, 1 = bug
-    class_weights = compute_class_weight(
-        class_weight="balanced",
-        classes=classes,
-        y=y_train,
-    )
-    class_weight_dict = {0: class_weights[0], 1: class_weights[1]}
+    # Compute class weights to handle class imbalance
+    # NOTE: We compute from the (possibly trimmed) training dataset.
+    class_weight_dict = compute_class_weights_from_ds(train_ds, num_classes)
     print("Class weights:", class_weight_dict)
 
     # Build model
-    model = build_model()
+    model = build_model(num_classes)
     model.summary(print_fn=lambda x: print("   " + x))
 
-    # Early stopping on val_loss to keep best model
+    # Early stopping + checkpoint
     early_stop = tf.keras.callbacks.EarlyStopping(
         monitor="val_loss",
-        patience=2,
+        patience=3,
         restore_best_weights=True,
     )
 
-    # Decide how many epochs to run (debug vs full)
-    epochs = DEBUG_EPOCHS if DEBUG_MODE else EPOCHS
-
     # Train
     history = model.fit(
-        X_train,
-        y_train,
-        validation_data=(X_val, y_val),
-        batch_size=BATCH_SIZE,
-        epochs=epochs,
-        callbacks=[early_stop],
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,
         class_weight=class_weight_dict,
+        callbacks=[early_stop],
     )
 
-    # Evaluate on test set
-    print("\n📊 Evaluating on test set...")
-    y_pred_probs = model.predict(X_test).ravel()
-    y_pred = (y_pred_probs >= DECISION_THRESHOLD).astype(int)
-    print(f"Using decision threshold {DECISION_THRESHOLD}, fraction predicted as bug: {y_pred.mean():.3f}")
+    # Evaluate on validation set and print classification report
+    print("\n📊 Evaluating on validation set...")
+    y_true = []
+    y_pred = []
 
-    print("\n📊 DL Model Evaluation (CNN + BiLSTM):")
-    print(classification_report(y_test, y_pred, target_names=["clean", "bug"]))
+    for images, labels in val_ds:
+        preds = model.predict(images, verbose=0)
+        pred_labels = np.argmax(preds, axis=1)
+        y_true.extend(labels.numpy())
+        y_pred.extend(pred_labels)
 
-    # Save model & tokenizer
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    print("\n📊 Validation Classification Report:")
+    print(classification_report(y_true, y_pred, target_names=class_names))
+
+    # Evaluate on held-out test set
+    print("\n📊 Evaluating on TEST set...")
+    y_true_test = []
+    y_pred_test = []
+
+    for images, labels in test_ds:
+        preds = model.predict(images, verbose=0)
+        pred_labels = np.argmax(preds, axis=1)
+        y_true_test.extend(labels.numpy())
+        y_pred_test.extend(pred_labels)
+
+    y_true_test = np.array(y_true_test)
+    y_pred_test = np.array(y_pred_test)
+
+    print("\n📊 Test Classification Report:")
+    print(classification_report(y_true_test, y_pred_test, target_names=class_names))
+
+    # Save model + class names
     model.save(DL_MODEL_PATH)
-    joblib.dump(tokenizer, TOKENIZER_PATH)
+    joblib.dump(class_names, CLASS_NAMES_PATH)
 
-    print(f"\n✅ DL model saved to: {DL_MODEL_PATH}")
-    print(f"✅ Tokenizer saved to: {TOKENIZER_PATH}")
+    print(f"\n✅ PCB defect model saved to: {DL_MODEL_PATH}")
+    print(f"✅ Class names saved to: {CLASS_NAMES_PATH}")
 
-def predict_single(code_tokens: str):
+
+# -------------
+# Inference helper
+# -------------
+
+def predict_single_image(image_path: str):
     """
-    Predict bug vs clean for a single HDL snippet (as tokenized string).
-    code_tokens: a string of space-separated tokens.
+    Load a single PCB image and predict its defect class.
+
+    Parameters
+    ----------
+    image_path : str
+        Path to the image file to classify.
+
+    Returns
+    -------
+    (predicted_label: str, confidence: float)
     """
-    # Load trained model and tokenizer
+    if not DL_MODEL_PATH.exists() or not CLASS_NAMES_PATH.exists():
+        raise FileNotFoundError(
+            "Model or class names file not found. "
+            "Train the model first by running this script."
+        )
+
     model = tf.keras.models.load_model(DL_MODEL_PATH)
-    tokenizer = joblib.load(TOKENIZER_PATH)
+    class_names = joblib.load(CLASS_NAMES_PATH)
 
-    seq = tokenizer.texts_to_sequences([code_tokens])
-    X = pad_sequences(seq, maxlen=MAX_LEN, padding="post", truncating="post")
+    img = tf.keras.utils.load_img(image_path, target_size=IMG_SIZE)
+    x = tf.keras.utils.img_to_array(img)
+    x = np.expand_dims(x, axis=0)
+    x = x.astype("float32") / 255.0
 
-    prob = model.predict(X).ravel()[0]
-    pred = int(prob >= 0.5)
-    confidence = float(prob if pred == 1 else 1 - prob)
+    preds = model.predict(x)
+    pred_idx = int(np.argmax(preds, axis=1)[0])
+    confidence = float(np.max(preds))
 
-    label_map_rev = {0: "clean", 1: "bug"}
-    return label_map_rev[pred], confidence
+    predicted_label = class_names[pred_idx]
+    return predicted_label, confidence
 
 
 if __name__ == "__main__":
