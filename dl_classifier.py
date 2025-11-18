@@ -390,7 +390,16 @@ def train_model():
     y_pred = np.array(y_pred)
 
     print("\n📊 Validation Classification Report:")
-    print(classification_report(y_true, y_pred, target_names=class_names))
+    labels = np.arange(num_classes)
+    print(
+        classification_report(
+            y_true,
+            y_pred,
+            labels=labels,
+            target_names=class_names,
+            zero_division=0,
+        )
+    )
 
     # Evaluate on held-out test set
     print("\n📊 Evaluating on TEST set...")
@@ -407,7 +416,16 @@ def train_model():
     y_pred_test = np.array(y_pred_test)
 
     print("\n📊 Test Classification Report:")
-    print(classification_report(y_true_test, y_pred_test, target_names=class_names))
+    labels_test = np.arange(num_classes)
+    print(
+        classification_report(
+            y_true_test,
+            y_pred_test,
+            labels=labels_test,
+            target_names=class_names,
+            zero_division=0,
+        )
+    )
 
     # Save model + class names
     model.save(DL_MODEL_PATH)
