@@ -63,12 +63,13 @@ BATCH_SIZE = 32
 # Backbone / architecture choice
 #   "efficientnet" (default): EfficientNetB0 backbone
 #   "simple_cnn"            : small custom CNN backbone (for experiments)
-MODEL_BACKBONE = "efficientnet"
+# For this experiment we use the simpler CNN to sanity-check the data.
+MODEL_BACKBONE = "simple_cnn"
 
 # Two‑stage training hyperparameters (main training)
-HEAD_EPOCHS = 10               # train only classifier head first
+HEAD_EPOCHS = 40               # train longer since we skip fine-tuning
 HEAD_LEARNING_RATE = 1e-3
-FINE_TUNE_EPOCHS = 30          # additional epochs with partial backbone unfrozen
+FINE_TUNE_EPOCHS = 0           # not used when MODEL_BACKBONE = "simple_cnn"
 FINE_TUNE_LEARNING_RATE = 1e-5
 FINE_TUNE_NUM_LAYERS = 80      # how many EfficientNet layers (from the end) to unfreeze
 
