@@ -69,7 +69,7 @@ DEBUG_VAL_STEPS = 30       # number of batches for validation when debug
 # Optional tiny overfit sanity-check mode
 # When True, we train on a very small subset of the data without augmentation
 # to verify that the model can overfit (reach very high training accuracy).
-SANITY_OVERFIT_MODE = False
+SANITY_OVERFIT_MODE = True
 SANITY_OVERFIT_TRAIN_IMAGES = 64
 SANITY_OVERFIT_VAL_IMAGES = 64
 
