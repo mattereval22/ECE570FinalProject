@@ -8,6 +8,14 @@ import matplotlib.pyplot as plt
 import joblib
 import tensorflow as tf
 
+# Streamlit/IO helpers for optional UI
+import io
+
+try:
+    import streamlit as st  # type: ignore
+except ImportError:  # streamlit not required when using this as a library
+    st = None
+
 # -------------------------------------------------------------------
 # Paths – adjust RAW_PCB_ROOT if your Drive path is different
 # -------------------------------------------------------------------
@@ -372,6 +380,185 @@ def evaluate_board_gt_crops(
 
 
 # -------------------------------------------------------------------
+# Streamlit helpers: model loading + single-patch prediction
+# -------------------------------------------------------------------
+
+def _load_patch_model_and_classes():
+    """Load the trained patch model and class names from disk.
+
+    This is used both by Streamlit and by any other code that wants to
+    reuse the patch classifier.
+    """
+    if not DL_MODEL_PATH.exists() or not CLASS_NAMES_PATH.exists():
+        raise FileNotFoundError(
+            f"Model or class names not found at {DL_MODEL_PATH} / {CLASS_NAMES_PATH}. "
+            "Make sure you have copied the trained .keras file and the class-name pickle "
+            "into this project directory."
+        )
+
+    model = tf.keras.models.load_model(DL_MODEL_PATH)
+    class_names = joblib.load(CLASS_NAMES_PATH)
+    return model, class_names
+
+
+if st is not None:
+    # Cache model in Streamlit so we don't reload on every interaction
+    @st.cache_resource
+    def get_model_and_classes():
+        return _load_patch_model_and_classes()
+else:
+    # Non-Streamlit environment: simple loader
+    def get_model_and_classes():
+        return _load_patch_model_and_classes()
+
+
+def _preprocess_patch(img: Image.Image) -> np.ndarray:
+    """Resize a PIL image to the CNN input size and turn it into a batch array."""
+    resized = img.resize(IMG_SIZE, Image.BILINEAR)
+    arr = np.array(resized).astype("float32") / 255.0
+    return np.expand_dims(arr, axis=0)  # (1, H, W, 3)
+
+
+def _crop_square(img: Image.Image, center_x: int, center_y: int, side: int) -> Image.Image:
+    """Crop a square region from `img`, clamped to image bounds.
+
+    Args:
+        img: PIL.Image
+        center_x, center_y: crop center in pixel coordinates
+        side: side length of the square in pixels
+    """
+    W, H = img.size
+    half = side / 2
+    xmin = int(max(0, center_x - half))
+    ymin = int(max(0, center_y - half))
+    xmax = int(min(W, center_x + half))
+    ymax = int(min(H, center_y + half))
+    return img.crop((xmin, ymin, xmax, ymax))
+
+
+def run_streamlit_app():
+    """Streamlit UI for classifying a single cropped patch from a user image.
+
+    Usage from the terminal:
+
+        streamlit run board_scanner.py
+    """
+    if st is None:
+        raise RuntimeError(
+            "Streamlit is not installed. Install it with `pip install streamlit` "
+            "and then run `streamlit run board_scanner.py`."
+        )
+
+    st.set_page_config(page_title="PCB Defect Classifier", layout="wide")
+    st.title("PCB Defect Classifier (Patch Model)")
+    st.write(
+        "Upload a microscope image of a PCB, choose a square region using the sliders, "
+        "and the model will classify the patch as one of the 6 defect types. "
+        "If no class is very confident, the app will report the patch as likely healthy/unknown."
+    )
+
+    # Load model & classes (cached)
+    try:
+        model, class_names = get_model_and_classes()
+    except FileNotFoundError as e:
+        st.error(str(e))
+        return
+
+    healthy_thresh = 0.7  # if max probability below this, treat as "no strong defect"
+
+    uploaded_file = st.file_uploader(
+        "Upload a PCB image (JPG/PNG)", type=["jpg", "jpeg", "png"]
+    )
+
+    if uploaded_file is None:
+        st.info("Upload an image to begin.")
+        return
+
+    # Read the uploaded image
+    try:
+        img = Image.open(uploaded_file).convert("RGB")
+    except Exception as exc:  # pragma: no cover - defensive
+        st.error(f"Could not open image: {exc}")
+        return
+
+    W, H = img.size
+    st.write(f"**Original image size:** {W}×{H} pixels")
+
+    st.image(img, caption="Original uploaded image", use_column_width=True)
+
+    st.subheader("Select square crop")
+
+    min_side = 64
+    max_side = int(min(W, H))
+    default_side = min(224 * 2, max_side)  # a bit zoomed out by default
+
+    side = st.slider(
+        "Crop side length (pixels)",
+        min_value=min_side,
+        max_value=max_side,
+        value=default_side,
+        step=8,
+    )
+
+    half = side / 2
+    # Ensure the square stays inside the image
+    cx_min, cx_max = int(half), int(max(half, W - half))
+    cy_min, cy_max = int(half), int(max(half, H - half))
+
+    default_cx = W // 2
+    default_cy = H // 2
+
+    center_x = st.slider("Crop center X (pixels)", cx_min, cx_max, default_cx)
+    center_y = st.slider("Crop center Y (pixels)", cy_min, cy_max, default_cy)
+
+    crop = _crop_square(img, center_x, center_y, side)
+    patch_batch = _preprocess_patch(crop)
+
+    # Run prediction
+    probs = model.predict(patch_batch, verbose=0)[0]
+    best_idx = int(np.argmax(probs))
+    best_cls = class_names[best_idx]
+    best_p = float(probs[best_idx])
+
+    # Visualize crop location
+    vis = img.copy()
+    draw = ImageDraw.Draw(vis)
+    xmin = int(center_x - half)
+    ymin = int(center_y - half)
+    xmax = int(center_x + half)
+    ymax = int(center_y + half)
+    xmin = max(0, xmin)
+    ymin = max(0, ymin)
+    xmax = min(W, xmax)
+    ymax = min(H, ymax)
+    draw.rectangle([xmin, ymin, xmax, ymax], outline="red", width=3)
+
+    st.subheader("Crop preview")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(vis, caption="Crop location (red box)", use_column_width=True)
+    with col2:
+        st.image(crop.resize(IMG_SIZE, Image.BILINEAR),
+                 caption=f"Patch sent to model {IMG_SIZE[0]}×{IMG_SIZE[1]}",
+                 width=IMG_SIZE[0])
+
+    st.subheader("Prediction")
+    if best_p < healthy_thresh:
+        st.write(
+            f"**No strong defect detected.** Max confidence {best_p:.2f} for class `{best_cls}`. "
+            "This patch may be healthy or from a defect type the model has not seen."
+        )
+    else:
+        st.write(
+            f"**Predicted defect:** `{best_cls}` with confidence **{best_p:.3f}**"
+        )
+
+    st.write("Class probabilities:")
+    prob_table = {"class": class_names, "probability": [float(p) for p in probs]}
+    st.table(prob_table)
+
+
+# -------------------------------------------------------------------
 # High-level demo: sample a few boards from train/val/test
 # -------------------------------------------------------------------
 
@@ -437,12 +624,13 @@ def run_demo(
 
 
 if __name__ == "__main__":
-    # Default: try a few test boards
-    run_demo(split="test", num_boards=5)
-
-    # Example: debug a single board by cropping GT boxes and classifying them
-    # from pathlib import Path
-    # model = tf.keras.models.load_model(DL_MODEL_PATH)
-    # class_names = joblib.load(CLASS_NAMES_PATH)
-    # sample_board = BOARD_DATA_ROOT / "test" / "Spurious_copper" / "06_spurious_copper_04.jpg"
-    # evaluate_board_gt_crops(sample_board, model, class_names, show_plot=True)
+    # When executed directly we prefer to launch the Streamlit app.
+    if st is not None:
+        run_streamlit_app()
+    else:
+        print("Streamlit is not installed.")
+        print("Install it with `pip install streamlit` and then run:")
+        print("    streamlit run board_scanner.py")
+        # Optional fallback: still allow the old CLI demo if someone
+        # runs the file without Streamlit.
+        # run_demo(split="test", num_boards=5)
