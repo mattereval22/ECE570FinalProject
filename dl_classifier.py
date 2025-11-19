@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import json
 import joblib
 import numpy as np
 
@@ -36,11 +37,17 @@ try:
 except Exception as e:
     print("Could not set GPU memory growth:", e)
 
-# -----------------------
+ # -----------------------
 # Paths & hyperparameters
 # -----------------------
 
-BASE_DIR = Path(__file__).resolve().parent
+# Prefer the project folder on Google Drive when running in Colab,
+# otherwise fall back to the local repo directory.
+COLAB_DRIVE_BASE = Path("/content/drive/MyDrive/ECE570FinalProject")
+if COLAB_DRIVE_BASE.exists():
+    BASE_DIR = COLAB_DRIVE_BASE
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 # Root directory where the **cropped defect patch** dataset is linked.
 # In Colab we set this up as: /content/ECE570FinalProject/data/pcb_patches
@@ -546,6 +553,15 @@ def train_model():
                 )
         else:
             print("\nℹ️ MODEL_BACKBONE != 'efficientnet'; skipping fine-tuning stage.")
+    # Save training history (if available) so Colab sessions can be inspected later
+    try:
+        if "history" in locals() and hasattr(history, "history"):
+            history_path = BASE_DIR / "train_history.json"
+            with open(history_path, "w") as f:
+                json.dump(history.history, f)
+            print(f"\n✅ Saved training history to: {history_path}")
+    except Exception as e:
+        print(f"\n⚠️ Could not save training history: {e}")
 
     # Evaluate on validation set and print classification report
     print("\n📊 Evaluating on validation set...")
