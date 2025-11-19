@@ -84,8 +84,8 @@ def sliding_window_scan(
     model: tf.keras.Model,
     class_names,
     patch_size=(224, 224),
-    stride=112,
-    prob_thresh=0.9,
+    stride=28,
+    prob_thresh=0.5,
 ):
     """
     Slide a window over the full board and classify each patch.
@@ -182,9 +182,9 @@ def evaluate_board_on_full_image(
     board_img_path: Path,
     model: tf.keras.Model,
     class_names,
-    prob_thresh=0.9,
-    stride=112,
-    iou_thresh=0.3,
+    prob_thresh=0.5,
+    stride=28,
+    iou_thresh=0.25,
     show_plot=True,
 ):
     """
@@ -285,6 +285,92 @@ def evaluate_board_on_full_image(
     }
 
 
+def evaluate_board_gt_crops(
+    board_img_path: Path,
+    model: tf.keras.Model,
+    class_names,
+    show_plot=True,
+):
+    """
+    For each GT object, crop a padded square patch around it, resize to model input,
+    and classify it. Print results and optionally show a grid of crops with predictions.
+    """
+    # Figure out class folder and filename to locate XML
+    cls_folder = board_img_path.parent.name        # e.g. 'Spurious_copper'
+    filename = board_img_path.name                 # e.g. '06_spurious_copper_04.jpg'
+    xml_name = board_img_path.stem + ".xml"        # same stem
+
+    xml_path = RAW_ANNOT_DIR / cls_folder / xml_name
+    if not xml_path.exists():
+        print(f"⚠️ XML not found for {board_img_path}, skipping.")
+        return []
+
+    _, gt_objects = parse_xml(xml_path)
+    if not gt_objects:
+        print(f"⚠️ No objects in XML for {board_img_path}, skipping.")
+        return []
+
+    # Load full board image
+    img = Image.open(board_img_path).convert("RGB")
+
+    crops = []
+    gt_classes = []
+
+    for obj in gt_objects:
+        gxmin, gymin, gxmax, gymax = obj["xmin"], obj["ymin"], obj["xmax"], obj["ymax"]
+        gw = gxmax - gxmin
+        gh = gymax - gymin
+        side = int(max(gw, gh) * 1.5)
+        cx = (gxmin + gxmax) / 2
+        cy = (gymin + gymax) / 2
+
+        xmin = max(0, int(cx - side / 2))
+        ymin = max(0, int(cy - side / 2))
+        xmax = min(img.width, int(cx + side / 2))
+        ymax = min(img.height, int(cy + side / 2))
+
+        crop = img.crop((xmin, ymin, xmax, ymax)).resize(IMG_SIZE, Image.BILINEAR)
+        crops.append(np.array(crop))
+        gt_classes.append(voc_to_model_class_name(obj["class_name"]))
+
+    if not crops:
+        print("No GT crops to evaluate.")
+        return []
+
+    x_batch = np.stack(crops, axis=0).astype("float32") / 255.0
+    probs = model.predict(x_batch, verbose=0)
+    pred_idxs = probs.argmax(axis=1)
+    pred_probs = probs.max(axis=1)
+
+    results = []
+    for gt_cls, c_idx, p in zip(gt_classes, pred_idxs, pred_probs):
+        pred_cls = class_names[c_idx]
+        correct = (pred_cls == gt_cls)
+        print(f"GT: {gt_cls}  →  Pred: {pred_cls} (p={p:.2f})")
+        results.append({
+            "gt_class": gt_cls,
+            "pred_class": pred_cls,
+            "prob": float(p),
+            "correct": correct,
+        })
+
+    if show_plot:
+        n = len(crops)
+        cols = min(5, n)
+        rows = (n + cols - 1) // cols
+        plt.figure(figsize=(cols * 3, rows * 3))
+        for i, (crop_arr, gt_cls, c_idx, p) in enumerate(zip(crops, gt_classes, pred_idxs, pred_probs)):
+            pred_cls = class_names[c_idx]
+            plt.subplot(rows, cols, i + 1)
+            plt.imshow(crop_arr)
+            plt.axis('off')
+            plt.title(f"{gt_cls} / {pred_cls}\n(p={p:.2f})")
+        plt.tight_layout()
+        plt.show()
+
+    return results
+
+
 # -------------------------------------------------------------------
 # High-level demo: sample a few boards from train/val/test
 # -------------------------------------------------------------------
@@ -292,9 +378,9 @@ def evaluate_board_on_full_image(
 def run_demo(
     split="test",
     num_boards=5,
-    prob_thresh=0.9,
-    stride=112,
-    iou_thresh=0.3,
+    prob_thresh=0.5,
+    stride=28,
+    iou_thresh=0.25,
 ):
     """
     Sample some full boards from pcb_defects/<split>/<class>/ and run the scanner.
@@ -353,3 +439,10 @@ def run_demo(
 if __name__ == "__main__":
     # Default: try a few test boards
     run_demo(split="test", num_boards=5)
+
+    # Example: debug a single board by cropping GT boxes and classifying them
+    # from pathlib import Path
+    # model = tf.keras.models.load_model(DL_MODEL_PATH)
+    # class_names = joblib.load(CLASS_NAMES_PATH)
+    # sample_board = BOARD_DATA_ROOT / "test" / "Spurious_copper" / "06_spurious_copper_04.jpg"
+    # evaluate_board_gt_crops(sample_board, model, class_names, show_plot=True)
