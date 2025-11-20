@@ -25,6 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # Your trained patch model + class names (same as dl_classifier.py)
 DL_MODEL_PATH = BASE_DIR / "pcb_defect_classifier.keras"
 CLASS_NAMES_PATH = BASE_DIR / "pcb_class_names.pkl"
+CENTROIDS_PATH = BASE_DIR / "pcb_class_centroids.npy"
 
 # Full-board split dataset (what you used to create pcb_patches)
 BOARD_DATA_ROOT = BASE_DIR / "data" / "pcb_defects"
@@ -398,7 +399,15 @@ def _load_patch_model_and_classes():
 
     model = tf.keras.models.load_model(DL_MODEL_PATH)
     class_names = joblib.load(CLASS_NAMES_PATH)
-    return model, class_names
+
+    centroids = None
+    if CENTROIDS_PATH.exists():
+        try:
+            centroids = np.load(CENTROIDS_PATH)
+        except Exception:
+            centroids = None
+
+    return model, class_names, centroids
 
 
 if st is not None:
@@ -457,14 +466,14 @@ def run_streamlit_app():
         "If no class is very confident, the app will report the patch as likely healthy/unknown."
     )
 
-    # Load model & classes (cached)
+    # Load model, classes, and optional centroids (cached)
     try:
-        model, class_names = get_model_and_classes()
+        model, class_names, centroids = get_model_and_classes()
     except FileNotFoundError as e:
         st.error(str(e))
         return
 
-    healthy_thresh = 0.7  # if max probability below this, treat as "no strong defect"
+    healthy_thresh = 0.7  # softmax-based "no strong defect" threshold
 
     uploaded_file = st.file_uploader(
         "Upload a PCB image (JPG/PNG)", type=["jpg", "jpeg", "png"]
@@ -495,6 +504,25 @@ def run_streamlit_app():
         "  - Larger size → more zoomed-out context.\n"
         "- The selected square will always be resized to the model's input size."
     )
+
+    anomaly_thresh = None
+    if centroids is not None:
+        st.markdown("### Optional: anomaly / 'clean board' check")
+        st.write(
+            "When the model's internal feature vector is far from all class centroids, "
+            "the patch may be out-of-distribution (e.g., a truly clean/unknown region)."
+        )
+        anomaly_thresh = st.slider(
+            "Feature-space distance threshold",
+            min_value=0.0,
+            max_value=50.0,
+            value=20.0,
+            step=0.5,
+            help=(
+                "If the distance from the patch features to the nearest training centroid "
+                "is greater than this value, the app will treat it as 'no defect detected'."
+            ),
+        )
 
     # Relative crop size: fraction of the smaller image dimension
     side_frac = st.slider(
@@ -583,22 +611,50 @@ def run_streamlit_app():
     # Prepare batch for model
     patch_batch = _preprocess_patch(crop)
 
-    # Run prediction
+    # Run classification
     probs = model.predict(patch_batch, verbose=0)[0]
     best_idx = int(np.argmax(probs))
     best_cls = class_names[best_idx]
     best_p = float(probs[best_idx])
 
+    # Optional: feature-space anomaly/clean-board check using centroids
+    nearest_dist = None
+    if centroids is not None and anomaly_thresh is not None:
+        try:
+            feature_layer = model.get_layer("feature_dense")
+            feature_model = tf.keras.Model(model.input, feature_layer.output)
+            feats = feature_model.predict(patch_batch, verbose=0)[0]
+            dists = np.linalg.norm(centroids - feats, axis=1)
+            nearest_dist = float(dists.min())
+        except Exception:
+            nearest_dist = None
+
     st.subheader("Prediction")
-    if best_p < healthy_thresh:
+
+    is_anomaly = False
+    if nearest_dist is not None and anomaly_thresh is not None:
+        is_anomaly = nearest_dist > anomaly_thresh
+
+    if best_p < healthy_thresh or is_anomaly:
         st.write(
-            f"Prediction: **No defect detected** "
-            f"(max class `{best_cls}`, confidence {best_p*100:.1f}%)."
+            "Prediction: **No defect detected / clean or unknown region**."
+        )
+        st.caption(
+            f"Max class `{best_cls}` (confidence {best_p*100:.1f}%)"
+            + (
+                f"; nearest centroid distance {nearest_dist:.2f} ≥ threshold {anomaly_thresh:.2f}"
+                if nearest_dist is not None and anomaly_thresh is not None
+                else ""
+            )
         )
     else:
         st.write(
             f"Prediction: **{best_cls}** with confidence **{best_p*100:.1f}%**."
         )
+        if nearest_dist is not None and anomaly_thresh is not None:
+            st.caption(
+                f"Nearest centroid distance {nearest_dist:.2f} ≤ threshold {anomaly_thresh:.2f}"
+            )
 
 
 # -------------------------------------------------------------------
