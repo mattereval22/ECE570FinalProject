@@ -452,8 +452,8 @@ def run_streamlit_app():
     st.set_page_config(page_title="PCB Defect Classifier", layout="wide")
     st.title("PCB Defect Classifier (Patch Model)")
     st.write(
-        "Upload a microscope image of a PCB, choose a square region using the sliders, "
-        "and the model will classify the patch as one of the 6 defect types. "
+        "Upload a microscope image of a PCB, adjust the square region of interest using the sliders below, "
+        "and the model will classify that patch as one of the 6 defect types. "
         "If no class is very confident, the app will report the patch as likely healthy/unknown."
     )
 
@@ -484,34 +484,103 @@ def run_streamlit_app():
     W, H = img.size
     st.write(f"**Original image size:** {W}×{H} pixels")
 
-    st.image(img, caption="Original uploaded image", use_column_width=True)
+    st.image(img, caption="Original uploaded image", use_container_width=True)
 
-    st.subheader("Select square crop")
+    st.subheader("Select region of interest (square)")
 
-    min_side = 64
-    max_side = int(min(W, H))
-    default_side = min(224 * 2, max_side)  # a bit zoomed out by default
-
-    side = st.slider(
-        "Crop side length (pixels)",
-        min_value=min_side,
-        max_value=max_side,
-        value=default_side,
-        step=8,
+    st.markdown(
+        "- Use the **position sliders** to move the crop box over the image.\n"
+        "- Use the **crop size slider** to choose how zoomed-in you want the patch to be:\n"
+        "  - Smaller size → more zoomed-in on a small area.\n"
+        "  - Larger size → more zoomed-out context.\n"
+        "- The selected square will always be resized to the model's input size."
     )
 
-    half = side / 2
-    # Ensure the square stays inside the image
-    cx_min, cx_max = int(half), int(max(half, W - half))
-    cy_min, cy_max = int(half), int(max(half, H - half))
+    # Relative crop size: fraction of the smaller image dimension
+    side_frac = st.slider(
+        "Crop size (relative to min image dimension)",
+        min_value=0.1,
+        max_value=1.0,
+        value=0.3,
+        step=0.05,
+        help="Move this left for a tight, zoomed-in crop; right for a larger, zoomed-out crop.",
+    )
+    max_side = min(W, H)
+    side = int(max_side * side_frac)
 
-    default_cx = W // 2
-    default_cy = H // 2
+    # Position sliders: expressed as fraction of image width/height
+    col_pos1, col_pos2 = st.columns(2)
+    with col_pos1:
+        cx_frac = st.slider(
+            "Horizontal position",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.01,
+        )
+    with col_pos2:
+        cy_frac = st.slider(
+            "Vertical position",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.01,
+        )
 
-    center_x = st.slider("Crop center X (pixels)", cx_min, cx_max, default_cx)
-    center_y = st.slider("Crop center Y (pixels)", cy_min, cy_max, default_cy)
+    cx = W * cx_frac
+    cy = H * cy_frac
+    half = side / 2.0
 
-    crop = _crop_square(img, center_x, center_y, side)
+    xmin = int(max(0, cx - half))
+    ymin = int(max(0, cy - half))
+    xmax = int(min(W, cx + half))
+    ymax = int(min(H, cy + half))
+
+    # Adjust if we hit borders so the crop remains square with desired side length
+    crop_w = xmax - xmin
+    crop_h = ymax - ymin
+    if crop_w < side:
+        shift = side - crop_w
+        if xmin - shift >= 0:
+            xmin -= shift
+        elif xmax + shift <= W:
+            xmax += shift
+        crop_w = xmax - xmin
+    if crop_h < side:
+        shift = side - crop_h
+        if ymin - shift >= 0:
+            ymin -= shift
+        elif ymax + shift <= H:
+            ymax += shift
+        crop_h = ymax - ymin
+
+    # Final safety clamp
+    xmin = max(0, xmin)
+    ymin = max(0, ymin)
+    xmax = min(W, xmin + min(side, W - xmin))
+    ymax = min(H, ymin + min(side, H - ymin))
+
+    crop = img.crop((xmin, ymin, xmax, ymax))
+
+    st.subheader("Crop preview")
+    col1, col2 = st.columns(2)
+    with col1:
+        vis = img.copy()
+        draw = ImageDraw.Draw(vis)
+        draw.rectangle([xmin, ymin, xmax, ymax], outline="red", width=3)
+        st.image(vis, caption="Selected region (red box)", use_container_width=True)
+    with col2:
+        st.image(
+            crop.resize(IMG_SIZE, Image.BILINEAR),
+            caption=f"Patch to be classified ({IMG_SIZE[0]}×{IMG_SIZE[1]})",
+            width=IMG_SIZE[0],
+        )
+
+    run_btn = st.button("Run prediction on selected region")
+    if not run_btn:
+        return
+
+    # Prepare batch for model
     patch_batch = _preprocess_patch(crop)
 
     # Run prediction
@@ -520,42 +589,16 @@ def run_streamlit_app():
     best_cls = class_names[best_idx]
     best_p = float(probs[best_idx])
 
-    # Visualize crop location
-    vis = img.copy()
-    draw = ImageDraw.Draw(vis)
-    xmin = int(center_x - half)
-    ymin = int(center_y - half)
-    xmax = int(center_x + half)
-    ymax = int(center_y + half)
-    xmin = max(0, xmin)
-    ymin = max(0, ymin)
-    xmax = min(W, xmax)
-    ymax = min(H, ymax)
-    draw.rectangle([xmin, ymin, xmax, ymax], outline="red", width=3)
-
-    st.subheader("Crop preview")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.image(vis, caption="Crop location (red box)", use_column_width=True)
-    with col2:
-        st.image(crop.resize(IMG_SIZE, Image.BILINEAR),
-                 caption=f"Patch sent to model {IMG_SIZE[0]}×{IMG_SIZE[1]}",
-                 width=IMG_SIZE[0])
-
     st.subheader("Prediction")
     if best_p < healthy_thresh:
         st.write(
-            f"**No strong defect detected.** Max confidence {best_p:.2f} for class `{best_cls}`. "
-            "This patch may be healthy or from a defect type the model has not seen."
+            f"Prediction: **No defect detected** "
+            f"(max class `{best_cls}`, confidence {best_p*100:.1f}%)."
         )
     else:
         st.write(
-            f"**Predicted defect:** `{best_cls}` with confidence **{best_p:.3f}**"
+            f"Prediction: **{best_cls}** with confidence **{best_p*100:.1f}%**."
         )
-
-    st.write("Class probabilities:")
-    prob_table = {"class": class_names, "probability": [float(p) for p in probs]}
-    st.table(prob_table)
 
 
 # -------------------------------------------------------------------
