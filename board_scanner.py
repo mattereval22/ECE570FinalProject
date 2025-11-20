@@ -422,9 +422,14 @@ else:
 
 
 def _preprocess_patch(img: Image.Image) -> np.ndarray:
-    """Resize a PIL image to the CNN input size and turn it into a batch array."""
+    """Resize a PIL image to the CNN input size and turn it into a batch array.
+
+    Note: we do NOT divide by 255 here because the Keras model already includes
+    a `Rescaling(1./255)` layer as the first step in its graph. This keeps the
+    Streamlit preprocessing consistent with how the model was trained.
+    """
     resized = img.resize(IMG_SIZE, Image.BILINEAR)
-    arr = np.array(resized).astype("float32") / 255.0
+    arr = np.array(resized).astype("float32")  # keep in 0..255 range
     return np.expand_dims(arr, axis=0)  # (1, H, W, 3)
 
 
