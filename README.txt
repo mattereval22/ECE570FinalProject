@@ -2,6 +2,8 @@
 
 This project is an end-to-end pipeline for detecting defects on printed circuit boards (PCBs) using a convolutional neural network and an interactive Streamlit web app.
 
+Hosted app : https://defectdestroyer.streamlit.app  
+
 The backend model is trained on cropped defect patches from the Kaggle PCB Defects dataset and can classify six defect types:
 
 - `missing_hole`
@@ -19,9 +21,9 @@ The Streamlit app lets a user:
 4. See the most likely defect type (or “no defect detected” if confidence is low).
 
 
-## 1. Project Structure
+## 1. Code Structure
 
-Expected repo layout:
+Final project files (in the “Final Submit Project” folder):
 
 - `board_scanner.py`  
   Main Streamlit app. Handles:
@@ -29,28 +31,45 @@ Expected repo layout:
   - Interactive square crop (via drawable canvas)
   - Preprocessing the crop to 224×224
   - Running inference with the trained model
-  - Displaying the predicted defect type and confidence
+  - Displaying the predicted defect type, confidence, and (optionally) anomaly flag
+
+- `dl_classifier.py`  
+  Model training and evaluation script. Handles:
+  - Building train/val/test datasets from `data/pcb_patches`
+  - Defining the CNN architecture with data augmentation and BatchNorm
+  - Class-weight computation for balanced training
+  - Training loop with early stopping and ReduceLROnPlateau
+  - Validation/test evaluation and confusion matrices
+  - Saving:
+    - `pcb_defect_classifier.keras`
+    - `pcb_class_names.pkl`
+    - `pcb_class_centroids.npy`
+  - Convenience helpers for single-image prediction and anomaly scoring
 
 - `pcb_defect_classifier.keras`  
-  Trained Keras model.  
-  This is loaded by `board_scanner.py` at runtime.
+  Trained Keras model loaded by `board_scanner.py` and the prediction helpers in `dl_classifier.py`.
 
 - `pcb_class_names.pkl`  
-  List of class names in the correct order.  
-  Used to convert model outputs (indices) into human-readable labels.
+  List of class names in the correct order. Used to map model outputs (indices) to labels.
 
-- `pcb_class_centroids.npy`
-  Numpy array of feature centroids for each class, used for an extra anomaly/“no defect” check.
+- `pcb_class_centroids.npy`  
+  Numpy array / dict of feature centroids for each class, used to compute anomaly scores.
 
 - `requirements.txt`  
-  Python dependencies for Streamlit Cloud and local setup.
+  Python dependencies for the Streamlit app and, mostly, for training.
+
+- `AI_PCB_Defect_Identifier.tex`  
+  LaTeX source for the project report (ICLR-style). Not required to run the app, but documents the design and results.
+
+- `README.txt`  
+  This file.
 
 
-## 2. Dependencies
+## 2. Dependencies & Environments
 
-All runtime dependencies are declared in `requirements.txt`:
+All runtime dependencies for the Streamlit app are declared in `requirements.txt`:
 
-```
+```text
 streamlit>=1.30
 tensorflow>=2.15,<3.0
 numpy>=1.24,<3.0
@@ -59,50 +78,125 @@ matplotlib>=3.8
 joblib>=1.3
 ```
 
-Notes:
+Additional packages used during training (already available in Colab and many Python distros, but listed here for completeness):
 
-- These versions are chosen to be compatible with a typical Linux / Streamlit Cloud environment.
-- You do not need `tensorflow-macos` or `tensorflow-metal` on Streamlit Cloud; those are only for local Apple Silicon dev and are managed separately in your local Conda environment.
+- `scikit-learn` (for `classification_report`, `confusion_matrix`, and `compute_class_weight`)
+
+### Suggested local environment (example, Apple Silicon)
+
+```bash
+conda create -n pcbapp python=3.10
+conda activate pcbapp
+pip install -r requirements.txt
+pip install scikit-learn
+```
+
+> On Apple Silicon, training from scratch may also use `tensorflow-macos` and `tensorflow-metal`. These are not required on Streamlit Cloud, where a standard TensorFlow build is used.
 
 
-## 3. How the App Works (High-Level)
+## 3. Datasets and Models
 
-1. Model Loading
+### 3.1 Public Kaggle dataset (training data)
+
+The CNN is trained on the PCB Defects dataset from Kaggle:
+
+- Dataset: “PCB defects” (Peking University)  
+- URL: https://www.kaggle.com/datasets/akhatova/pcb-defects
+
+The raw dataset is not automatically downloaded by the code because:
+
+- Kaggle programmatic downloads require per-user API credentials and a terms-of-use agreement.
+- These credentials cannot be safely embedded in a public repository or auto-run in all environments.
+
+Instead, to reproduce training from scratch:
+
+1. Log into Kaggle and accept the terms for the PCB defects dataset.
+2. Download and unzip the dataset locally.
+3. Preprocess or organize the defect patches into the following directory structure under the project base:
+
+   ```text
+   data/pcb_patches/
+       train/
+           missing_hole/
+           mouse_bite/
+           open_circuit/
+           short/
+           spur/
+           spurious_copper/
+       val/
+           ...
+       test/
+           ...
+   ```
+
+4. Run `dl_classifier.py` (see Section 5) to train and save the model and class centroids.
+
+### 3.2 Real-world microscope images
+
+Additional evaluation was performed on proprietary microscope images of evaluation modules (EVMs) from an industrial setting.  
+These images cannot be included in the public repository due to company confidentiality. They are used only for qualitative testing and are not required to run the app.
+
+### 3.3 Pre-trained model artifacts
+
+For running the app without retraining:
+
+- `pcb_defect_classifier.keras`
+- `pcb_class_names.pkl`
+- `pcb_class_centroids.npy`
+
+These files are generated by `dl_classifier.py` after training. For local use:
+
+- Either train from scratch (Section 5) to produce these files, or
+- Download the provided artifacts from the course submission / release bundle and place them in the project root next to `board_scanner.py`.
+
+
+## 4. How the App Works (High-Level)
+
+1. **Model loading**
    - On startup, `board_scanner.py` loads:
      - `pcb_defect_classifier.keras`
      - `pcb_class_names.pkl`
+     - `pcb_class_centroids.npy` (for anomaly checks)
    - The model expects 224×224 RGB images normalized to [0, 1].
 
-2. User Workflow
-   - User opens the Streamlit app.
-   - Uploads a PCB image (e.g., microscope photo).
+2. **User workflow**
+   - User opens the Streamlit app (hosted or local).
+   - Uploads a PCB image (typically a microscope photo).
    - A drawable canvas is displayed with:
      - The uploaded image as the background.
      - A movable, resizable square crop box.
      - Controls to zoom in/out the displayed image.
-   - The user positions and resizes the square until it covers the trace region of interest.
-   - User clicks Submit.
+   - The user positions the square over the trace region of interest and clicks Submit.
    - The app:
      - Extracts the selected region.
      - Resizes it to 224×224.
      - Normalizes the pixels.
-     - Runs the patch through the model.
+     - Runs the patch through the CNN.
 
-3. Prediction & Output
-   - The app computes class probabilities from the softmax output.
-   - It selects the top predicted class and shows:
+3. **Prediction and anomaly check**
+   - The app computes class probabilities from the model’s softmax output.
+   - It displays:
      - The predicted defect label.
      - The associated probability (e.g., “spur – 97.3%”).
-   - If all probabilities are below a configurable threshold, the app displays:
-     - “No defect detected with high confidence.”
-   - It can also flag “anomalous / unknown pattern” when the feature vector is far from all class centroids.
+   - If all probabilities are below a threshold, or the feature embedding lies far from all class centroids, the app shows:
+     - “No defect detected with high confidence” or an “anomalous / unknown pattern” flag.
 
 
-## 4. Running the App Locally
+## 5. Running the Project
 
-These steps assume you’re using Conda and Apple Silicon (M-series), but the general flow is similar on other platforms.
+### 5.1 Hosted Streamlit app (no setup)
 
-1. Clone / copy the repo to your machine and ensure these files are present in the project folder:
+Simply visit:
+
+- https://defectdestroyer.streamlit.app
+
+Upload a PCB image, draw a square crop over a suspected defect, and submit to see the predicted label.
+
+
+### 5.2 Run the Streamlit app locally
+
+1. Ensure the following files are present in the project folder:
+
    - `board_scanner.py`
    - `requirements.txt`
    - `pcb_defect_classifier.keras`
@@ -110,72 +204,95 @@ These steps assume you’re using Conda and Apple Silicon (M-series), but the ge
    - `pcb_class_centroids.npy`
    - `README.txt`
 
-2. **Create and activate a Conda environment** (example):
+2. Create and activate an environment, then install dependencies:
 
    ```bash
    conda create -n pcbapp python=3.10
    conda activate pcbapp
-   ```
-
-3. **Install dependencies** from `requirements.txt`:
-
-   ```bash
    pip install -r requirements.txt
+   pip install scikit-learn
    ```
 
-   > On Apple Silicon you may additionally install `tensorflow-macos` / `tensorflow-metal` if running training locally, but this isn’t required just to run the app with a pre-trained model.
-
-4. **Run the Streamlit app**:
+3. Launch the app:
 
    ```bash
    streamlit run board_scanner.py
    ```
 
-5. **Open the app**
-   - Streamlit will print a local URL, typically:
-     - `http://localhost:8501`
-   - Open this URL in your browser to use the app.
+4. Open the provided local URL in a browser, upload an image, crop, and inspect predictions.
 
 
-## 5. Model Training (Background)
+### 5.3 Re-train the model from scratch
 
-Model training is **not** required for using the deployed app, but for reproducibility:
+Training is typically done in Google Colab with GPU acceleration, but can also run locally if a compatible GPU setup is available.
 
-- Training is done in a separate **Google Colab** notebook:
-  - Builds a dataset of cropped defect patches from the Kaggle PCB dataset.
-  - Runs a custom CNN with BatchNorm, data augmentation, and a learning rate schedule.
-  - Evaluates on val/test splits.
-  - Saves:
-    - `pcb_defect_classifier.keras`
-    - `pcb_class_names.pkl`
-    - `pcb_class_centroids.npy`
+1. Ensure the dataset directory exists as described in Section 3.1 (`data/pcb_patches/...`).
+2. Ensure `scikit-learn` is installed.
+3. Run:
 
-- After training in Colab:
-  - Download these artifacts.
+   ```bash
+   python dl_classifier.py
+   ```
 
-
-## 6. Usage Tips & Limitations
-
-- The model is trained on patches centered on defects. For best results, the crop in the app should:
-  - Keep the defect near the center.
-  - Include enough local context without being too zoomed out.
-
-- If the uploaded image is extremely high-resolution:
-  - It’s typically better to zoom out slightly and then let the app resize to 224×224, rather than cropping a tiny region with extremely fine detail.
-
-- This model recognizes only the six defect types it was trained on.
-  - Other kinds of damage or artifacts may be flagged as “no defect detected” or misclassified.
+4. The script will:
+   - Build train/val/test datasets.
+   - Train the CNN with data augmentation, class weights, and a learning-rate schedule.
+   - Print validation/test classification reports and confusion matrices.
+   - Save:
+     - `pcb_defect_classifier.keras`
+     - `pcb_class_names.pkl`
+     - `pcb_class_centroids.npy`
+     - `train_history.json` (training curves) in the project directory.
 
 
+## 6. Code Provenance and External Sources
 
-## 7. Summary
+The course requires a clear statement of which parts of the code were written for this project and which were adapted from prior or external sources. Below is a breakdown for the final project files.
 
-This project delivers an end-to-end pipeline for PCB defect detection: a CNN trained on Kaggle PCB defect patches, wrapped in an interactive Streamlit app where users can upload microscope images, crop regions of interest, and receive fast, explainable predictions across six defect types.
+### 6.1 `dl_classifier.py`
 
-Current limitations:
+- **Authorship:**  
+  Written specifically for this project. The file integrates ideas discussed in ECE 570, but there is no direct copy-paste from public GitHub repositories.
 
-- Manual patch selection only – The app can’t yet scan whole boards automatically; the user must draw a square crop around each region of interest.
-- Limited defect vocabulary – The model only knows the six Kaggle defect classes and may misbehave on unseen defect types, unusual PCB layouts, or very different imaging conditions.
-- Single-patch, single-defect focus – The system classifies one selected patch at a time; it does not localize, count, or characterize multiple defects across an entire PCB image.
+- **Adapted patterns (not verbatim copies):**
+  - **GPU configuration and memory growth:**  
+    The pattern of calling `tf.config.experimental.list_physical_devices("GPU")`, enabling memory growth, and disabling XLA JIT follows typical code shown in official TensorFlow documentation and tutorials, but has been customized for this script (print messages, error handling).
+  - Dataset creation with `image_dataset_from_directory`:
+    The use of `tf.keras.utils.image_dataset_from_directory` for train/val/test splits, followed by `.cache().prefetch()`, is inspired by TensorFlow “image classification” examples. Paths, class checks, and debug prints are specific to this project.
+  - Callbacks (`EarlyStopping`, `ReduceLROnPlateau`):
+    The combination of early stopping on validation loss and `ReduceLROnPlateau` is a common Keras pattern. The specific hyperparameters (patience values, min LR, etc.) are chosen and tuned for this PCB defect task.
 
-Going forward, natural next steps include adding full-board scanning (sliding-window or detector-style models), expanding the defect taxonomy with additional labeled data, and hardening the pipeline against real-world variation in lighting, zoom, and board design. Together, these extensions would turn the current proof-of-concept into a more general, production-ready PCB inspection assistant that could be deployed at my company.
+- Original / project-specific logic:
+  - The CNN architecture in `build_model` (stack of Conv2D + BatchNorm + MaxPooling blocks with a `feature_dense` layer and dropout) was designed and tuned for the PCB patches.
+  - The `build_datasets` function’s fallback behavior (using `BOARD_DATA_ROOT` if `DATA_ROOT` is missing) is project-specific.
+  - The `compute_class_weights_from_ds` helper and its integration into the training loop are tailored to this dataset.
+  - The evaluation logic (validation/test loops, printed confusion matrices via `print_confusion_matrix`, and `summarize_confusions`) is custom for this project.
+  - The feature-extractor and centroid computation (`build_feature_extractor`, `compute_class_centroids`) and the anomaly-aware prediction helper (`predict_single_image_with_anomaly`) are project-specific additions for handling “no defect / unknown pattern” cases.
+
+### 6.2 `board_scanner.py`
+
+- **Authorship:**  
+  Written for this project to serve as the GUI front end.
+
+- Adapted elements:
+  - The general pattern of using Streamlit for file upload (`st.file_uploader`) and laying out controls in columns follows the official Streamlit documentation.
+  - The interactive cropping is based on the “drawable canvas” paradigm and uses a pattern similar to community examples of `streamlit-drawable-canvas`. The actual integration (square-only crop, normalization to model input, anomaly display) is custom.
+
+- **Original / project-specific logic:**
+  - The logic for converting canvas coordinates into a square crop on the original image.
+  - The wiring between the crop, the trained model, the class names, and the anomaly score.
+  - The UX flow tailored specifically to PCB traces (instructions, messaging, “no defect detected” handling).
+
+## 7. Usage Tips & Limitations
+
+- The model is trained on defect-centered patches from the Kaggle dataset. For best results, the crop in the app should:
+  - Put the suspected defect near the center.
+  - Include enough surrounding copper/board context without zooming out too far.
+
+- The model only recognizes the six defect types listed above.
+  - Other kinds of damage or unusual board layouts may be misclassified or flagged as “no defect / anomalous.”
+
+- The current app processes one crop at a time.
+  - It does not scan entire boards automatically or output defect counts.
+
+Despite these limitations, the system provides a practical prototype for reducing tedious microscope inspection work: a lightweight CNN plus an intuitive GUI that allows an engineer to quickly probe many regions on a board and obtain high-accuracy defect classifications in real time.
