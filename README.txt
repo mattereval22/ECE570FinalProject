@@ -31,7 +31,7 @@ Final project files (in the “Final Submit Project” folder):
   - Interactive square crop (via drawable canvas)
   - Preprocessing the crop to 224×224
   - Running inference with the trained model
-  - Displaying the predicted defect type, confidence, and (optionally) anomaly flag
+  - Displaying the predicted defect type, confidence, and anomaly flag
 
 - `dl_classifier.py`  
   Model training and evaluation script. Handles:
@@ -46,6 +46,13 @@ Final project files (in the “Final Submit Project” folder):
     - `pcb_class_centroids.npy`
   - Convenience helpers for single-image prediction and anomaly scoring
 
+- `prepare_dataset.py`  
+  One-time dataset preparation script. Handles:
+  - Downloading and unzipping the PCB Defects Kaggle dataset from https://www.kaggle.com/datasets/akhatova/pcb-defects/data into `data/raw_kaggle` (using the Kaggle CLI and your local `~/kaggle.json` credentials).
+  - Parsing XML annotations to crop defect-centered patches from full board images.
+  - Building the `data/pcb_patches/train|val|test/...` directory tree expected by `dl_classifier.py`.
+  - Reusing an already-prepared `data/pcb_patches` tree if present (so users can run the project offline with a pre-packaged dataset).
+
 - `pcb_defect_classifier.keras`  
   Trained Keras model loaded by `board_scanner.py` and the prediction helpers in `dl_classifier.py`.
 
@@ -58,9 +65,6 @@ Final project files (in the “Final Submit Project” folder):
 - `requirements.txt`  
   Python dependencies for the Streamlit app and, mostly, for training.
 
-- `AI_PCB_Defect_Identifier.tex`  
-  LaTeX source for the project report (ICLR-style). Not required to run the app, but documents the design and results.
-
 - `README.txt`  
   This file.
 
@@ -69,13 +73,16 @@ Final project files (in the “Final Submit Project” folder):
 
 All runtime dependencies for the Streamlit app are declared in `requirements.txt`:
 
-```text
+```
 streamlit>=1.30
 tensorflow>=2.15,<3.0
 numpy>=1.24,<3.0
 Pillow>=10.0
-matplotlib>=3.8
 joblib>=1.3
+scikit-learn>=1.3
+kaggle>=1.5
+matplotlib>=3.8
+pandas>=2.0
 ```
 
 Additional packages used during training (already available in Colab and many Python distros, but listed here for completeness):
@@ -98,38 +105,31 @@ pip install scikit-learn
 
 ### 3.1 Public Kaggle dataset (training data)
 
-The CNN is trained on the PCB Defects dataset from Kaggle:
+The Streamlit app itself does not download the raw dataset automatically because Kaggle programmatic downloads require per-user API credentials and a terms-of-use agreement. These credentials cannot be safely embedded in a public repository or auto-run in all environments.
 
-- Dataset: “PCB defects” (Peking University)  
-- URL: https://www.kaggle.com/datasets/akhatova/pcb-defects
+However, for offline training in this project, the script `prepare_dataset.py` can automatically:
+- Download and unzip the Kaggle dataset into `data/raw_kaggle` using the Kaggle CLI (assuming you have `kaggle` installed and `/kaggle.json` configured), and
+- Build cropped defect patches from the XML annotations into the `data/pcb_patches/train|val|test/...` structure.
 
-The raw dataset is not automatically downloaded by the code because:
+Instead, to reproduce training from scratch, follow below:
 
-- Kaggle programmatic downloads require per-user API credentials and a terms-of-use agreement.
-- These credentials cannot be safely embedded in a public repository or auto-run in all environments.
-
-Instead, to reproduce training from scratch:
+In local environment of on Google Colab (automatic, offline)
 
 1. Log into Kaggle and accept the terms for the PCB defects dataset.
-2. Download and unzip the dataset locally.
-3. Preprocess or organize the defect patches into the following directory structure under the project base:
+2. Install the Kaggle CLI and place your API token at `/kaggle.json` (standard Kaggle setup).
+3. From the project root, run:
 
-   ```text
-   data/pcb_patches/
-       train/
-           missing_hole/
-           mouse_bite/
-           open_circuit/
-           short/
-           spur/
-           spurious_copper/
-       val/
-           ...
-       test/
-           ...
+   ```bash
+   python prepare_dataset.py
    ```
 
+   This will:
+   - Download and unzip the PCB Defects dataset into `data/raw_kaggle`, and
+   - Build the cropped defect patches into `data/pcb_patches/train|val|test/...`.
+
 4. Run `dl_classifier.py` (see Section 5) to train and save the model and class centroids.
+
+5. Lastly, run 'board_scanner.py' to launch the entire app
 
 ### 3.2 Real-world microscope images
 
@@ -216,7 +216,7 @@ Upload a PCB image, draw a square crop over a suspected defect, and submit to se
 3. Launch the app:
 
    ```bash
-   streamlit run board_scanner.py
+    python -m streamlit run board_scanner.py
    ```
 
 4. Open the provided local URL in a browser, upload an image, crop, and inspect predictions.
@@ -224,9 +224,17 @@ Upload a PCB image, draw a square crop over a suspected defect, and submit to se
 
 ### 5.3 Re-train the model from scratch
 
-Training is typically done in Google Colab with GPU acceleration, but can also run locally if a compatible GPU setup is available.
+1. Prepare the dataset (one time):
+   - If you have Kaggle credentials configured, from the project root run:
 
-1. Ensure the dataset directory exists as described in Section 3.1 (`data/pcb_patches/...`).
+     ```bash
+     python prepare_dataset.py
+     ```
+
+     This will download the PCB Defects dataset (if needed) and build the `data/pcb_patches/train|val|test/...` directory tree.
+
+   - Alternatively, manually create `data/pcb_patches/...` as described in Section 3.1.
+
 2. Ensure `scikit-learn` is installed.
 3. Run:
 
@@ -234,20 +242,10 @@ Training is typically done in Google Colab with GPU acceleration, but can also r
    python dl_classifier.py
    ```
 
-4. The script will:
-   - Build train/val/test datasets.
-   - Train the CNN with data augmentation, class weights, and a learning-rate schedule.
-   - Print validation/test classification reports and confusion matrices.
-   - Save:
-     - `pcb_defect_classifier.keras`
-     - `pcb_class_names.pkl`
-     - `pcb_class_centroids.npy`
-     - `train_history.json` (training curves) in the project directory.
-
 
 ## 6. Code Provenance and External Sources
 
-The course requires a clear statement of which parts of the code were written for this project and which were adapted from prior or external sources. Below is a breakdown for the final project files.
+Below is a breakdown for the final project files.
 
 ### 6.1 `dl_classifier.py`
 
